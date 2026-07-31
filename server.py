@@ -84,9 +84,40 @@ from kokoro import KPipeline
 
 app = Flask(__name__)
 
-# lang_code "a" = American English; change as needed. This loads once at
-# startup so requests don't pay model-load cost each time.
-pipeline = KPipeline(lang_code="a")
+# Kokoro voice names encode their language as the first letter (e.g.
+# "af_heart" -> American, "bf_emma" -> British), which is also the
+# lang_code KPipeline needs. Callers only ever specify a voice, never a
+# lang_code, so we derive it here and keep one pipeline per lang_code,
+# built lazily on first use and cached for the lifetime of the process.
+# The American pipeline is always built eagerly at startup (it's the
+# default voice's language and is baked into the Docker image); other
+# lang_codes are only built the first time a voice needs them, so a
+# server that never receives a British-voice request never pays for a
+# second pipeline.
+_pipelines = {}
+_pipelines_lock = threading.Lock()
+
+
+def _get_pipeline(voice):
+    """Returns the KPipeline for the given voice's language, creating and
+    caching it on first use. Not synthesis-safe to call concurrently for
+    a *new* lang_code until the lock is released, but callers only ever
+    read from the dict after that, which is safe."""
+    lang_code = voice[0]
+    pipeline = _pipelines.get(lang_code)
+    if pipeline is not None:
+        return pipeline
+    with _pipelines_lock:
+        pipeline = _pipelines.get(lang_code)
+        if pipeline is None:
+            pipeline = KPipeline(lang_code=lang_code)
+            _pipelines[lang_code] = pipeline
+        return pipeline
+
+
+# Build the American pipeline eagerly at startup so the default voice
+# pays no first-request latency penalty.
+_pipelines["a"] = KPipeline(lang_code="a")
 
 DEFAULT_VOICE = "af_heart"
 SAMPLE_RATE = 24000
@@ -99,18 +130,26 @@ SAMPLE_RATE = 24000
 # guarantee.
 WORDS_PER_MINUTE = 165
 
-# American English voices available under lang_code='a' (see
+# American and British English voices (see
 # https://huggingface.co/hexgrad/Kokoro-82M/blob/main/VOICES.md). Voices
-# from other languages aren't included here since this server's pipeline
-# is fixed to English g2p and wouldn't pronounce them correctly. A handful
-# of these (see Dockerfile) are baked into the image at build time for
-# zero-network-latency use; the rest still work, they just download their
-# voice pack from Hugging Face on first use.
+# from other languages aren't included here since this server only ever
+# builds pipelines for lang_codes it recognizes via the voice name's
+# first letter, and non-English g2p isn't exercised/supported by this
+# server. Callers just pick a voice; _get_pipeline() figures out whether
+# it needs the American ('a') or British ('b') pipeline from the voice
+# name itself, so there's nothing lang-related for a caller to specify.
+# A handful of these (see Dockerfile) are baked into the image at build
+# time for zero-network-latency use; the rest still work, they just
+# download their voice pack from Hugging Face on first use.
 VALID_VOICES = frozenset({
+    # American English
     "af_heart", "af_alloy", "af_aoede", "af_bella", "af_jessica", "af_kore",
     "af_nicole", "af_nova", "af_river", "af_sarah", "af_sky",
     "am_adam", "am_echo", "am_eric", "am_fenrir", "am_liam", "am_michael",
     "am_onyx", "am_puck", "am_santa",
+    # British English
+    "bf_alice", "bf_emma", "bf_isabella", "bf_lily",
+    "bm_daniel", "bm_fable", "bm_george", "bm_lewis",
 })
 
 # --- Rendering-time estimation -------------------------------------------
@@ -258,6 +297,7 @@ def _run_pipeline(text, voice, speed, play):
     duration measurement). Raises RuntimeError if synthesis produced no
     audio."""
     paplay_proc = _open_paplay_stream() if play else None
+    pipeline = _get_pipeline(voice)
 
     start = time.time()
     audio_chunks = []

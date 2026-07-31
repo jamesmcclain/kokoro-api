@@ -67,9 +67,12 @@ RUN mkdir -p /tmp/torchinductor /tmp/huggingface && chmod -R 777 /tmp
 # runtime, and the runtime UID won't match the build-time (root) owner.
 RUN python3 -c "\
 from kokoro import KPipeline; \
-pipeline = KPipeline(lang_code='a'); \
-voices = ['af_heart', 'am_santa', 'am_michael', 'am_onyx', 'af_river', 'af_alloy', 'af_nicole', 'am_adam', 'am_echo']; \
-[list(pipeline('Hello world', voice=v)) for v in voices]" \
+pipeline_a = KPipeline(lang_code='a'); \
+voices_a = ['af_heart', 'am_santa', 'am_michael', 'am_onyx', 'af_river', 'af_alloy', 'af_nicole', 'am_adam', 'am_echo']; \
+[list(pipeline_a('Hello world', voice=v)) for v in voices_a]; \
+pipeline_b = KPipeline(lang_code='b'); \
+voices_b = ['bf_emma', 'bm_george']; \
+[list(pipeline_b('Hello world', voice=v)) for v in voices_b]" \
     && chmod -R 777 /tmp/huggingface /tmp/torchinductor
 
 COPY server.py /app/server.py
