@@ -10,6 +10,22 @@ immediately (409 Conflict) rather than queued; the error response includes
 an estimate of how many seconds remain until the speaker is free, and the
 same estimate can be polled at any time via GET /speaker.
 
+Queueing is strictly opt-in and lives on its own endpoint,
+POST /queue_with_no_guarantee_of_playing. Nothing about /speak changes:
+it never queues, never waits, and still 409s the moment the speaker isn't
+idle. The queue endpoint offers no guarantee that an accepted utterance is
+ever actually spoken, and — deliberately — no way for a caller to find
+out. Accepted text cannot be cancelled or removed; it either exits through
+the speaker or is dropped, and the caller is told neither. The only
+failure a queue caller ever observes is the up-front rejection when the
+queue is already full (503).
+
+Wherever this server reports "time until the speaker is free", that number
+is the sum of the WHOLE pipeline: whatever is playing now plus every
+queued entry behind it. With an empty queue that is exactly the old
+single-utterance figure, so existing callers of GET /speaker and of the
+409 body keep their previous semantics unchanged.
+
 There is no async/sync switch: the execution mode is determined entirely
 by what the request is for. Playback ("play": true, the default) is
 asynchronous per force — the request is validated, the speaker is claimed,
@@ -25,9 +41,15 @@ Endpoints:
   GET  /health   -> {"status": "ok"}
   GET  /speaker  -> {
                       "busy": true|false,
+                      "queue_entries": <integer>,
                       "estimated_seconds_until_free": <number>
                     }
-                  Approximately how long until the speaker is free.
+                  Approximately how long until the speaker is free, counting
+                  the current utterance AND everything queued behind it.
+                  "queue_entries" is how many queued utterances are still
+                  waiting (it excludes the one currently playing), so
+                  busy=true with queue_entries=0 is the pre-queue state:
+                  one utterance playing, nothing behind it.
                   0.0 with busy=false means the speaker is free right now.
                   The estimate is derived from the word-count/RTF heuristic
                   described below, so it can undershoot: if it reaches 0.0
@@ -70,8 +92,31 @@ Endpoints:
                   removed; a request that still sends either gets a 400
                   explaining the new contract, rather than a silent
                   reinterpretation of what the caller meant.
+
+  POST /queue_with_no_guarantee_of_playing
+                  body: {
+                     "text": "...",           (required)
+                     "voice": "af_heart",     (optional, default af_heart)
+                     "speed": 1.0             (optional, default 1.0, range 0.1-3.0)
+                   }
+                  Appends the utterance to the playback queue and returns
+                  202 immediately. The endpoint name is the contract: there
+                  is NO guarantee the text is ever spoken, and no way to
+                  ask. A queued entry cannot be removed once accepted.
+                  Synthesis failures are logged and swallowed; the caller
+                  is not told. The 202 body reports the state of the queue
+                  after the append ("queue_entries", "queue_seconds") purely
+                  so a caller can pace itself — those numbers say nothing
+                  about whether any earlier submission was heard.
+
+                  503 is the only failure a caller can act on: the queue is
+                  full (by entry count or by total queued seconds) and this
+                  text was NOT accepted. There is no "play" field here;
+                  sending one is a 400, since this endpoint always plays
+                  and never returns audio.
 """
 
+import collections
 import io
 import subprocess
 import threading
@@ -226,9 +271,23 @@ def _try_claim_speaker(estimated_duration_seconds):
     """Attempts to claim the speaker without blocking. On success, records
     when it's expected to be free again and returns True; the caller (or a
     thread the caller spawns) is then responsible for _release_speaker().
-    Returns False if some other utterance currently holds it."""
+    Returns False if some other utterance currently holds it, or if queued
+    utterances are still waiting.
+
+    The queue check matters: without it, a /speak request could win the
+    mutex in the gap between two queued utterances and cut the line. A
+    caller that wanted fail-fast semantics gets them — 409 — and the
+    accompanying estimate covers the whole queue, so the caller isn't told
+    to retry in three seconds only to be rejected again by the next queued
+    entry. Momentarily holding the mutex to look at the queue is harmless:
+    the queue worker acquires it blocking, so it just waits."""
     global _speaker_busy_until
     if not _speaker_mutex.acquire(blocking=False):
+        return False
+    with _queue_lock:
+        queue_is_pending = bool(_queue)
+    if queue_is_pending:
+        _speaker_mutex.release()
         return False
     with _speaker_state_lock:
         _speaker_busy_until = time.monotonic() + estimated_duration_seconds
@@ -243,15 +302,117 @@ def _release_speaker():
 
 
 def _speaker_status():
-    """Returns (busy, estimated_seconds_until_free). The estimate is
-    approximate (see _speaker_busy_until above) and clamped to >= 0; it
-    can be 0.0 while busy is still True if the heuristic undershot."""
-    busy = _speaker_mutex.locked()
-    if not busy:
-        return False, 0.0
-    with _speaker_state_lock:
-        remaining = _speaker_busy_until - time.monotonic()
-    return True, max(round(remaining, 1), 0.0)
+    """Returns (busy, queue_entries, estimated_seconds_until_free).
+
+    The seconds figure is the sum of the whole pipeline: the remainder of
+    whatever is playing now, plus the estimates of every entry still
+    queued behind it. With an empty queue this reduces exactly to the
+    old single-utterance number.
+
+    "busy" means the speaker is not idle for any reason — playing, or with
+    work queued that hasn't started yet. A caller asking "can I speak right
+    now?" gets the truthful answer from this flag, not from the estimate,
+    which is a heuristic and can reach 0.0 early."""
+    with _queue_lock:
+        queue_entries = len(_queue)
+        queued_seconds = _queued_seconds
+    playing = _speaker_mutex.locked()
+    if not playing and queue_entries == 0:
+        return False, 0, 0.0
+    remaining = 0.0
+    if playing:
+        with _speaker_state_lock:
+            remaining = _speaker_busy_until - time.monotonic()
+    total = max(remaining, 0.0) + queued_seconds
+    return True, queue_entries, max(round(total, 1), 0.0)
+
+
+# --- Unguaranteed playback queue -------------------------------------------
+#
+# POST /queue_with_no_guarantee_of_playing appends here. A single worker
+# thread drains it, one utterance at a time, taking the same speaker mutex
+# that /speak takes — so queued and direct playback can never overlap, and
+# arrival order is playback order.
+#
+# The "no guarantee" in the endpoint name is load-bearing and is enforced
+# here by omission: nothing in this section records per-entry outcomes,
+# exposes an entry id, or offers a way to remove an accepted entry. A
+# synthesis failure is logged and the worker moves on. Callers cannot
+# distinguish "spoken", "dropped", or "still waiting", and that is the
+# intended contract, not a gap to be filled in later.
+#
+# Because nothing can be cancelled, admission control is the only place
+# where the system can protect itself, so it is deliberately conservative
+# and bounded two ways: by entry count, and by total projected seconds
+# (one 20-minute submission is a far worse hostage than eight short ones).
+MAX_QUEUE_ENTRIES = 8
+MAX_QUEUE_SECONDS = 300.0
+
+_queue = collections.deque()
+_queued_seconds = 0.0  # sum of the estimates of the entries in _queue
+_queue_lock = threading.Condition()
+
+
+def _queue_snapshot():
+    """(entries, seconds) for the entries still waiting. Excludes whatever
+    the worker has already pulled off and started playing — that portion is
+    accounted for by _speaker_busy_until instead."""
+    with _queue_lock:
+        return len(_queue), round(_queued_seconds, 1)
+
+
+def _try_enqueue(text, voice, speed):
+    """Appends one utterance if there is room. Returns (accepted, entries,
+    seconds) describing the queue after the decision. Rejection is the only
+    signal this endpoint ever gives a caller, so it happens here, up front,
+    while the caller is still listening."""
+    global _queued_seconds
+    estimated_duration = _estimate_total_duration(text, speed)
+    with _queue_lock:
+        full = (
+            len(_queue) >= MAX_QUEUE_ENTRIES
+            or _queued_seconds + estimated_duration > MAX_QUEUE_SECONDS
+        )
+        if not full:
+            _queue.append((text, voice, speed, estimated_duration))
+            _queued_seconds += estimated_duration
+            _queue_lock.notify()
+        return (not full), len(_queue), round(_queued_seconds, 1)
+
+
+def _queue_worker():
+    """Single consumer. Waits for an entry, claims the speaker (blocking —
+    unlike /speak, waiting is the whole point here), plays it, releases.
+
+    The entry is popped only after the mutex is held, so it stays counted
+    in _queued_seconds until the moment it becomes the utterance that
+    _speaker_busy_until describes. That hand-off is what keeps
+    'seconds until free' from double-counting or dropping the entry as it
+    transitions from waiting to playing.
+
+    Every failure is caught and logged: this loop must never exit, or the
+    queue would silently stop draining while still accepting entries."""
+    global _queued_seconds, _speaker_busy_until
+    while True:
+        try:
+            with _queue_lock:
+                while not _queue:
+                    _queue_lock.wait()
+            _speaker_mutex.acquire()
+            try:
+                with _queue_lock:
+                    text, voice, speed, estimated_duration = _queue.popleft()
+                    _queued_seconds = max(_queued_seconds - estimated_duration, 0.0)
+                with _speaker_state_lock:
+                    _speaker_busy_until = time.monotonic() + estimated_duration
+                try:
+                    _run_pipeline(text, voice, speed, play=True)
+                except Exception as e:
+                    app.logger.error("queued synthesis failed for voice=%s: %s", voice, e)
+            finally:
+                _release_speaker()
+        except Exception as e:  # pragma: no cover - the loop must survive anything
+            app.logger.error("queue worker iteration failed: %s", e)
 
 
 def _open_paplay_stream():
@@ -353,14 +514,74 @@ def health():
 
 @app.route("/speaker", methods=["GET"])
 def speaker():
-    """Approximately how long until the speaker is free. busy=false means
-    it's free right now; busy=true with a 0.0 estimate means the current
-    utterance overran its estimate and should finish imminently."""
-    busy, seconds = _speaker_status()
+    """Approximately how long until the speaker is free, counting the
+    current utterance plus everything queued behind it. busy=false means
+    it's free right now; busy=true with a 0.0 estimate means the pipeline
+    overran its estimate and should finish imminently."""
+    busy, queue_entries, seconds = _speaker_status()
     return jsonify({
         "busy": busy,
+        "queue_entries": queue_entries,
         "estimated_seconds_until_free": seconds,
     })
+
+
+def _validate_speech_params(text, voice, speed):
+    """Shared parameter validation for both playback endpoints. Returns a
+    (body, status) tuple to return to the caller, or None if the
+    parameters are acceptable. Kept in one place so the queue endpoint
+    can't drift into accepting something /speak rejects."""
+    if not text:
+        return {"error": "missing 'text' field"}, 400
+    if voice not in VALID_VOICES:
+        return {
+            "error": f"unknown voice '{voice}'",
+            "valid_voices": sorted(VALID_VOICES),
+        }, 400
+    if not isinstance(speed, (int, float)) or not (0.1 <= speed <= 3.0):
+        return {"error": "'speed' must be a number between 0.1 and 3.0"}, 400
+    return None
+
+
+@app.route("/queue_with_no_guarantee_of_playing", methods=["POST"])
+def queue_with_no_guarantee_of_playing():
+    """Appends an utterance to the playback queue, or rejects it because
+    the queue is full. That rejection is the last thing the caller will
+    ever learn about this text: an accepted entry cannot be removed, its
+    outcome is never reported, and no endpoint exists to ask.
+
+    Validation is still synchronous — a malformed request is the caller's
+    bug and it gets told about that immediately, which is a different
+    thing from being told whether the audio played."""
+    payload = request.get_json(force=True, silent=True) or {}
+    text = payload.get("text")
+    voice = payload.get("voice", DEFAULT_VOICE)
+    speed = payload.get("speed", 1.0)
+
+    if "play" in payload:
+        return jsonify({
+            "error": "this endpoint has no 'play' field: it always plays "
+                     "through the speaker and never returns audio. Use "
+                     "POST /speak with play=false to download a WAV.",
+        }), 400
+    invalid = _validate_speech_params(text, voice, speed)
+    if invalid is not None:
+        body, status = invalid
+        return jsonify(body), status
+
+    accepted, queue_entries, queue_seconds = _try_enqueue(text, voice, speed)
+    if not accepted:
+        return jsonify({
+            "error": "queue is full",
+            "queue_entries": queue_entries,
+            "queue_seconds": queue_seconds,
+        }), 503
+    return jsonify({
+        "status": "queued",
+        "voice": voice,
+        "queue_entries": queue_entries,
+        "queue_seconds": queue_seconds,
+    }), 202
 
 
 @app.route("/speak", methods=["POST"])
@@ -391,15 +612,10 @@ def speak():
                      "when its 202 response is sent). Drop the field and "
                      "choose the mode via 'play'.",
         }), 400
-    if not text:
-        return jsonify({"error": "missing 'text' field"}), 400
-    if voice not in VALID_VOICES:
-        return jsonify({
-            "error": f"unknown voice '{voice}'",
-            "valid_voices": sorted(VALID_VOICES),
-        }), 400
-    if not isinstance(speed, (int, float)) or not (0.1 <= speed <= 3.0):
-        return jsonify({"error": "'speed' must be a number between 0.1 and 3.0"}), 400
+    invalid = _validate_speech_params(text, voice, speed)
+    if invalid is not None:
+        body, status = invalid
+        return jsonify(body), status
     if not isinstance(play, bool):
         return jsonify({"error": "'play' must be a boolean"}), 400
 
@@ -411,7 +627,7 @@ def speak():
         # requests race.
         estimated_duration = _estimate_total_duration(text, speed)
         if not _try_claim_speaker(estimated_duration):
-            _, seconds_until_free = _speaker_status()
+            _, _, seconds_until_free = _speaker_status()
             return jsonify({
                 "error": "speaker is busy",
                 "estimated_seconds_until_free": seconds_until_free,
@@ -468,6 +684,12 @@ def _warm_up():
 
 if __name__ == "__main__":
     _warm_up()
+    # The queue worker is the only thread that ever plays queued audio, so
+    # it must be running before the queue endpoint can accept anything.
+    # Daemon: a queue that hasn't drained must not keep the process alive
+    # on shutdown — undelivered entries are, by this endpoint's contract,
+    # exactly as unobservable as delivered ones.
+    threading.Thread(target=_queue_worker, daemon=True).start()
     # Threaded so GET /speaker can be answered while a playback thread is
     # running (Flask's dev server is threaded by default, but be explicit:
     # the speaker-busy contract depends on concurrent request handling).
