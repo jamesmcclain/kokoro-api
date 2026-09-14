@@ -7,7 +7,13 @@ description: Use this skill whenever the user wants text spoken aloud (e.g. "say
 
 ## Overview
 
-This skill converts text to speech through a REST API at `http://10.0.2.2:5001`.
+This skill converts text to speech through a REST API. The server defaults to
+`10.0.2.2` and port `5001`, but every script accepts `--host` (a hostname or an
+IP address) and `--port` to point at a different server, e.g.
+`--host 192.168.1.33` or `--host 192.168.1.42 --port 5001`. Set `$KOKORO_HOST`
+and/or `$KOKORO_PORT` once to change the default for a whole session instead of
+passing the flags on every call. If the user names a specific machine, or if
+the default host is unreachable, use `--host` (and `--port` if needed).
 
 The host has one speaker. A server-side mutex controls the speaker. Playback is
 always asynchronous. Every call returns immediately, before the audio plays.
@@ -25,20 +31,30 @@ Two utterances never overlap, whichever way you use.
 
 **Use `scripts/*.py`, not raw `curl`.** These scripts use the `requests`
 library. They take text as an argument or as `--file`, so you never escape
-quotes or newlines by hand. Each script prints one terse status line, not a raw
-JSON blob. This keeps tool output small and saves tokens over many calls.
-All four scripts need `requests` (`pip install requests` if it is missing).
+quotes or newlines by hand. Each script prints one terse status line. This keeps
+tool output small and saves tokens over many calls.  All four scripts need
+`requests` (`pip install requests` if it is missing).
 
 **Three disciplines. Use exactly one per task.**
 
+**Discipline 2 (the Ordered Queue) is the default for any narration or
+read-through.** Reach for Discipline 1 only when you have a specific,
+articulable reason the text must go through the direct endpoint instead --
+for example, the user is waiting right now for this exact utterance and a
+queued, unobservable delivery would defeat the point. "It's shorter" or "it's
+just one line" are not such a reason; short narration still belongs in the
+queue.
+
 | Situation | Discipline |
 |-----------|-----------|
-| One short thing the user must hear | 1 — One-off speech |
-| Narrating a long task, or reading long text aloud | 2 — Ordered queue |
+| Narrating a long task, or reading long text aloud (default choice) | 2 — Ordered queue |
+| One short thing the user must hear right now, with a stated reason it can't be queued | 1 — One-off speech |
 | The user explicitly asked for an audio file | 3 — WAV download |
 
 Do not use Discipline 3 to make sound. Do not use Discipline 1 or 2 to make a
-file. Do not use Discipline 2 to avoid a busy speaker.
+file. Do not use Discipline 2 to avoid a busy speaker. Do not reach for
+Discipline 1 out of habit -- if you can't state why the queue won't do, use
+the queue.
 
 ## Scripts in 30 Seconds
 
@@ -85,7 +101,10 @@ speaker can report `0.0` seconds when playback is about to end. Trust the word
 
 **Options common to `speak.py`, `queue_ordered_speech_no_guarantee.py`, and
 `download_wav.py`:** positional `TEXT` or `--file PATH`, plus `--voice NAME` and
-`--speed 0.1`-`3.0`. Send nothing else. The server accepts only these fields.
+`--speed 0.1`-`3.0`. Send nothing else in the request payload -- the server
+accepts only these fields. All four scripts, including `check_speaker.py`,
+also take `--host` and `--port` to target a non-default server; these are
+local script options, not sent to the server.
 
 ## Choosing a Voice
 
@@ -133,15 +152,20 @@ must download its voice pack first.
 - Do not busy-wait. Busy-wait means running `check_speaker.py` twice in a row to
   see whether the state changed. Run it one time, then do useful work in a
   separate tool call. Read the status again only later, after that work is done.
-- One status read before each queue submission is not busy-wait. Discipline 2
-  needs that read to set its pace. The rule forbids repeated reads for the same
-  wait, not one read per unit of real work.
+- In Discipline 2, do not call `check_speaker.py` before each submission. Call
+  it once, at the start of the task, to confirm the server is up and working.
+  After that, every call to `queue_ordered_speech_no_guarantee.py` already
+  returns `queue_entries` and `queue_seconds` in its own response -- read those
+  to pace the next submission instead of polling the speaker separately.
 - Use one voice for a whole narration or read-through, unless the user asks you
   to change it.
 
 ## Discipline 1 — One-off Speech
 
-Use this discipline for a single short announcement that the user must hear.
+Use this discipline only when you can state a concrete reason the queue does
+not fit: the user is waiting right now for this specific utterance, and a
+queued, unobservable delivery would defeat the point. If you cannot state that
+reason, use Discipline 2 instead, even for a single short line.
 
 1. Run `python3 scripts/speak.py "<text>" [--voice ...] [--speed ...]`.
 2. If it prints `OK 202 ...`, the task is done. Do nothing more. Playback
@@ -156,16 +180,22 @@ Use this discipline for a single short announcement that the user must hear.
 CAUTION: A `BUSY` response means the user did not hear that text. Do not put it
 into the queue instead. The queue cannot tell you whether it played.
 
-## Discipline 2 — Ordered Queue
+## Discipline 2 — Ordered Queue (default)
 
-Use this discipline to narrate a long agentic task while you work. Examples: you
-write code across many steps, you refactor a large module, or you run a long
-migration. This is the intended use of the queue. Use the same discipline to
-read a long document aloud block by block.
+Use this discipline for narration in general: a long agentic task while you
+work, reading a long document aloud block by block, or any other multi-turn
+speech where nothing forces a synchronous, unqueued response. This is the
+default discipline -- reach past it only under the terms in Discipline 1.
 
 The queue takes text, holds it in arrival order, and plays each entry after the
 audio in front of it. You submit and continue working. You never wait for the
 speaker, and you never handle a busy speaker.
+
+Before the first submission of a task, run `check_speaker.py` once to confirm
+the server is reachable and working. You do not need to check again during the
+task: each call to `queue_ordered_speech_no_guarantee.py` reports its own
+`queue_entries` and `queue_seconds` after submission, and that is what you use
+to pace the next one (see the per-block loop below).
 
 ```bash
 python3 scripts/queue_ordered_speech_no_guarantee.py "Step three of six is complete." --voice am_onyx
@@ -220,6 +250,10 @@ Also use these limits:
 A block is one unit of speech: a milestone of your task, or a piece of a
 document. Use one to three sentences, about 30 seconds of speech.
 
+Before block 1, run `check_speaker.py` once for the whole task (see above).
+From then on, pace yourself from each submission's own response -- do not call
+`check_speaker.py` again inside this loop.
+
 1. Do the real work, or prepare the next block of the document. The real task is
    the priority. Narration never blocks it.
 2. Write the block. Use plain words. Remove markdown symbols (headings, `*`,
@@ -227,12 +261,11 @@ document. Use one to three sentences, about 30 seconds of speech.
    read code blocks, tables, or URLs word for word. Summarize them or skip them,
    and say that you do this. Expand abbreviations ("e.g." becomes "for
    example").
-3. Run `python3 scripts/check_speaker.py` one time.
-   - If `queue_entries` is 2 or less, go to step 4.
-   - If `queue_entries` is more than 2, do not submit. Return to step 1 and do
-     more real work. Read the status again on a later tool call. For narration,
-     skip this block instead of holding it.
-4. Run `queue_ordered_speech_no_guarantee.py` one time with the block.
+3. If the previous submission's response reported `queue_entries` greater than
+   2, do not submit yet. Return to step 1 and do more real work instead. For
+   narration, skip this block instead of holding it. Otherwise, go to step 4.
+4. Run `queue_ordered_speech_no_guarantee.py` one time with the block, and read
+   the `queue_entries`/`queue_seconds` it reports back.
    - `QUEUED` with a small `queue_seconds`: return to step 1.
    - `QUEUED` with a large `queue_seconds`: return to step 1, and skip the next
      one or two blocks.
@@ -300,6 +333,11 @@ python3 scripts/download_wav.py "Hello as a file." --voice af_heart --out output
   Divide the text into smaller pieces, or increase `--max-time`.
 - **`ModuleNotFoundError: requests`**: run `pip install requests` in the
   environment that runs these scripts.
+- **`ERROR request failed: ...` / connection refused or timed out**: the
+  default host (`10.0.2.2:5001`, or your `$KOKORO_HOST`/`$KOKORO_PORT`) is not
+  reachable. Confirm the hostname or IP with the user, then pass `--host`
+  (and `--port` if it's non-standard) on every script call, or export
+  `KOKORO_HOST`/`KOKORO_PORT` for the rest of the session.
 
 ## Quick Reference
 
@@ -310,3 +348,4 @@ python3 scripts/download_wav.py "Hello as a file." --voice af_heart --out output
 | Read the speaker status and queue length | `python3 scripts/check_speaker.py` |
 | Get a WAV file (on explicit request only) | `python3 scripts/download_wav.py "..." --voice af_heart --out out.wav` |
 | Queue text from a file (avoids shell escaping) | `python3 scripts/queue_ordered_speech_no_guarantee.py --file /tmp/block.txt --voice am_onyx` |
+| Target a different server | add `--host <name-or-ip> [--port <n>]` to any of the above, or export `KOKORO_HOST`/`KOKORO_PORT` |

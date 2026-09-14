@@ -12,23 +12,51 @@ entry. It never reports whether any particular queued entry was played --
 nothing does.
 
 Call this at most once per wait -- do not loop it. See the skill's Hard
-Rules for why.
+Rules for why. In Discipline 2 (the default), you normally call this exactly
+once per task, up front, to confirm the server is reachable -- not before
+every submission. Each queue submission already reports its own queue state.
+
+Usage:
+    check_speaker.py
+    check_speaker.py --host 192.168.1.33
+    check_speaker.py --host 192.168.1.42 --port 5001
+
+The server host defaults to $KOKORO_HOST (or 10.0.2.2 if that is unset) and
+the port defaults to $KOKORO_PORT (or 5001). Override either per-call with
+--host/--port, or export the environment variables once for a whole session.
 
 Exit codes:
     0 -> free
     1 -> busy
     3 -> network/other error
 """
+import argparse
+import os
 import sys
 
 import requests
 
-BASE_URL = "http://10.0.2.2:5001"
+DEFAULT_HOST = os.environ.get("KOKORO_HOST", "10.0.2.2")
+DEFAULT_PORT = os.environ.get("KOKORO_PORT", "5001")
 
 
 def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument(
+        "--host",
+        default=DEFAULT_HOST,
+        help=f"Server hostname or IP (default: {DEFAULT_HOST}, or $KOKORO_HOST)",
+    )
+    ap.add_argument(
+        "--port",
+        default=DEFAULT_PORT,
+        help=f"Server port (default: {DEFAULT_PORT}, or $KOKORO_PORT)",
+    )
+    args = ap.parse_args()
+    base_url = f"http://{args.host}:{args.port}"
+
     try:
-        r = requests.get(f"{BASE_URL}/speaker", timeout=10)
+        r = requests.get(f"{base_url}/speaker", timeout=10)
     except requests.RequestException as e:
         print(f"ERROR request failed: {e}")
         return 3
