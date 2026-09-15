@@ -1,6 +1,6 @@
 ---
 name: kokoro-api
-description: Use this skill whenever the user wants text spoken aloud (e.g. "say this out loud", "read this to me", "speak this text", "give a verbal update"), when an agent wants to narrate a long multi-step task such as writing code, or when the user explicitly asks for a .wav file of synthesized speech. Covers one-off spoken announcements, ordered multi-turn narration and read-throughs through an unguaranteed queue, non-blocking speaker-availability and queue-length checks, handling a busy speaker, and synchronous WAV download. Supports both American and British English voices.
+description: Use this skill whenever the user wants text spoken aloud (e.g. "say this out loud", "read this to me", "speak this text", "give a verbal update"), when an agent wants to narrate a long multi-step task such as writing code, or when the user explicitly asks for a .wav file of synthesized speech. Covers one-off spoken announcements, ordered multi-turn narration and read-throughs through an unguaranteed queue, non-blocking speaker-availability and queue-length checks, handling a busy speaker, and synchronous WAV download. Supports both American and British English voices, and optional audio effects (presets such as audiobook, radio, 8-bit, or a custom chain).
 ---
 
 # Kokoro Speak Guide
@@ -32,7 +32,7 @@ Two utterances never overlap, whichever way you use.
 **Use `scripts/*.py`, not raw `curl`.** These scripts use the `requests`
 library. They take text as an argument or as `--file`, so you never escape
 quotes or newlines by hand. Each script prints one terse status line. This keeps
-tool output small and saves tokens over many calls.  All four scripts need
+tool output small and saves tokens over many calls.  All five scripts need
 `requests` (`pip install requests` if it is missing).
 
 **Three disciplines. Use exactly one per task.**
@@ -99,12 +99,22 @@ entries that wait behind the current audio. Both numbers are estimates. A busy
 speaker can report `0.0` seconds when playback is about to end. Trust the word
 `FREE` or `BUSY` more than the number.
 
+**List the effect presets (instant, changes no server state):**
+```bash
+python3 scripts/list_effects.py
+# -> audiobook: HP 85Hz, Comp -22dB 3:1, EQ 2500Hz +2dB, Reverb 10%
+# -> radio: HP 400Hz, LP 4000Hz, Comp -24dB 6:1, Drive 8dB, Gain -4dB
+```
+Add `--stages` to also list each stage type and its parameter ranges. Exit
+code `0` means listed, `3` means a network error.
+
 **Options common to `speak.py`, `queue_ordered_speech_no_guarantee.py`, and
-`download_wav.py`:** positional `TEXT` or `--file PATH`, plus `--voice NAME` and
-`--speed 0.1`-`3.0`. Send nothing else in the request payload -- the server
-accepts only these fields. All four scripts, including `check_speaker.py`,
-also take `--host` and `--port` to target a non-default server; these are
-local script options, not sent to the server.
+`download_wav.py`:** positional `TEXT` or `--file PATH`, plus `--voice NAME`,
+`--speed 0.1`-`3.0`, and one of `--effect NAME` or `--effect-file PATH` (see
+Voice Effects). Send nothing else in the request payload -- the server
+accepts only these fields. All five scripts, including `check_speaker.py` and
+`list_effects.py`, also take `--host` and `--port` to target a non-default
+server; these are local script options, not sent to the server.
 
 ## Choosing a Voice
 
@@ -138,6 +148,53 @@ If the user asks for a British voice, pick `bf_emma` (female) or `bm_george`
 only when the user names one, or when `bf_emma` and `bm_george` do not fit the
 context. The first request for any other British voice takes longer. The server
 must download its voice pack first.
+
+## Voice Effects
+
+An effect changes the sound of a voice after synthesis. Examples are a
+compressed audiobook sound, a radio sound, or an 8-bit game sound. Effects
+work the same way in all three disciplines. An effect does not change how the
+speaker, the queue, or the WAV download behave.
+
+**Use an effect only when the user asks for one.** Do not add an effect to
+make narration more interesting. The default is no effect.
+
+1. Run `python3 scripts/list_effects.py` one time to get the preset names.
+2. Add `--effect NAME` to the script call. Preset names are not case-sensitive.
+3. Use the same effect for a whole narration or read-through, unless the user
+   asks you to change it. This is the same rule as for the voice.
+
+Built-in presets: `8-bit`, `ai`, `audiobook`, `cathedral`, `chipmunk`, `echo`,
+`giant`, `megaphone`, `radio`, `robot`, `telephone`. The server operator can
+add presets or replace built-in presets. Thus, `list_effects.py` is the
+correct list, not this paragraph.
+
+If no preset fits the request, build a custom chain. A chain is a JSON list of
+stages. The server applies the stages in order. Each stage has a `type` and
+optional parameters. Run `list_effects.py --stages` to get each type and the
+range of each parameter. Write the chain to a file, then pass
+`--effect-file PATH`:
+
+```bash
+cat > /tmp/chain.json <<'JSON'
+[{"type": "pitch", "semitones": -3},
+ {"type": "highpass", "cutoff_hz": 200},
+ {"type": "reverb", "room_size": 0.6, "wet": 0.25}]
+JSON
+python3 scripts/queue_ordered_speech_no_guarantee.py "The build finished." --effect-file /tmp/chain.json
+```
+
+- Stage types: `highpass`, `lowpass`, `eq`, `low_shelf`, `high_shelf`,
+  `compressor`, `gain`, `pitch`, `phaser`, `chorus`, `flanger`, `reverb`,
+  `delay`, `bitcrush`, `downsample`, `distortion`.
+- Parameters that you omit get their default values.
+- A pitch stage changes the pitch only. It does not change the speed. Use
+  `--speed` for the speed.
+- Reverb and delay add a tail of sound after the last word. The duration
+  estimates include this tail.
+- If the server rejects the effect, the script prints `BAD_REQUEST 400` with
+  the exact fault. For an unknown preset name, the line also contains
+  `valid_effects=[...]`.
 
 ## Hard Rules (all disciplines)
 
@@ -320,6 +377,11 @@ python3 scripts/download_wav.py "Hello as a file." --voice af_heart --out output
   Use Discipline 1 for text that the user must hear.
 - **`BAD_REQUEST 400` with `valid_voices`**: pick a voice from that list, or
   omit `--voice` to use the default.
+- **`BAD_REQUEST 400` with `valid_effects`**: pick a preset from that list, or
+  omit `--effect` to use no effect.
+- **`BAD_REQUEST local cannot read --effect-file`**: the file is missing or
+  does not contain valid JSON. Write the chain again, then send the request
+  again. The script did not send this request to the server.
 - **Any other `BAD_REQUEST 400`**: the printed error states the exact fault.
   Correct the request with the documented options only, then send it again.
 - **`check_speaker.py` prints `BUSY` with `0.0` seconds**: the estimate fell
@@ -348,4 +410,8 @@ python3 scripts/download_wav.py "Hello as a file." --voice af_heart --out output
 | Read the speaker status and queue length | `python3 scripts/check_speaker.py` |
 | Get a WAV file (on explicit request only) | `python3 scripts/download_wav.py "..." --voice af_heart --out out.wav` |
 | Queue text from a file (avoids shell escaping) | `python3 scripts/queue_ordered_speech_no_guarantee.py --file /tmp/block.txt --voice am_onyx` |
+| List effect presets | `python3 scripts/list_effects.py` |
+| List stage types for a custom chain | `python3 scripts/list_effects.py --stages` |
+| Speak with an effect preset | add `--effect audiobook` to any of the three request scripts |
+| Speak with a custom effect chain | add `--effect-file /tmp/chain.json` to any of the three request scripts |
 | Target a different server | add `--host <name-or-ip> [--port <n>]` to any of the above, or export `KOKORO_HOST`/`KOKORO_PORT` |

@@ -7,6 +7,8 @@ caller reading tool output doesn't burn tokens on formatting.
 Usage:
     speak.py "Deployment is complete." [--voice am_michael] [--speed 1.0]
     speak.py --file /tmp/block.txt [--voice bf_emma]
+    speak.py "Chapter one." --effect audiobook
+    speak.py "Beep boop." --effect-file /tmp/chain.json
     speak.py "Hello." --host 192.168.1.33
     speak.py "Hello." --host 192.168.1.42 --port 5001
 
@@ -21,6 +23,7 @@ Exit codes:
     3  -> network/other error
 """
 import argparse
+import json
 import os
 import sys
 
@@ -36,6 +39,17 @@ def main() -> int:
     ap.add_argument("--file", help="Read text from this file instead")
     ap.add_argument("--voice", default=None)
     ap.add_argument("--speed", type=float, default=None)
+    effect_group = ap.add_mutually_exclusive_group()
+    effect_group.add_argument(
+        "--effect",
+        default=None,
+        help="Effect preset name (see list_effects.py), e.g. audiobook",
+    )
+    effect_group.add_argument(
+        "--effect-file",
+        default=None,
+        help="JSON file holding an inline effect chain (a list of stages)",
+    )
     ap.add_argument(
         "--host",
         default=DEFAULT_HOST,
@@ -61,6 +75,15 @@ def main() -> int:
         payload["voice"] = args.voice
     if args.speed is not None:
         payload["speed"] = args.speed
+    if args.effect:
+        payload["effect"] = args.effect
+    elif args.effect_file:
+        try:
+            with open(args.effect_file, encoding="utf-8") as f:
+                payload["effect"] = json.load(f)
+        except (OSError, ValueError) as e:
+            print(f"BAD_REQUEST local cannot read --effect-file: {e}")
+            return 2
 
     try:
         r = requests.post(f"{base_url}/speak", json=payload, timeout=10)
@@ -82,6 +105,8 @@ def main() -> int:
         err = body.get("error", "unknown error")
         voices = body.get("valid_voices")
         extra = f" valid_voices={voices}" if voices else ""
+        effects = body.get("valid_effects")
+        extra += f" valid_effects={effects}" if effects else ""
         print(f"BAD_REQUEST 400 {err}{extra}")
         return 2
 

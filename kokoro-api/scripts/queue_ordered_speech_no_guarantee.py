@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Discipline 4 only: append one utterance to the unguaranteed playback queue.
+"""Discipline 2 only: append one utterance to the unguaranteed playback queue.
 
 Submits to POST /queue_with_no_guarantee_of_playing and returns at once. The
 text is played in arrival order, after whatever is already ahead of it.
@@ -15,6 +15,7 @@ so you can pace your next submission. They say nothing about earlier ones.
 Usage:
     queue_ordered_speech_no_guarantee.py "Step three of six is complete."
     queue_ordered_speech_no_guarantee.py --file /tmp/update.txt --voice am_onyx
+    queue_ordered_speech_no_guarantee.py "Build finished." --effect radio
     queue_ordered_speech_no_guarantee.py "Hello." --host 192.168.1.33
 
 The server host defaults to $KOKORO_HOST (or 10.0.2.2 if that is unset) and
@@ -33,6 +34,7 @@ Exit codes:
     3  -> network/other error
 """
 import argparse
+import json
 import os
 import sys
 
@@ -49,6 +51,17 @@ def main() -> int:
     ap.add_argument("--file", help="Read text from this file instead")
     ap.add_argument("--voice", default=None)
     ap.add_argument("--speed", type=float, default=None)
+    effect_group = ap.add_mutually_exclusive_group()
+    effect_group.add_argument(
+        "--effect",
+        default=None,
+        help="Effect preset name (see list_effects.py), e.g. audiobook",
+    )
+    effect_group.add_argument(
+        "--effect-file",
+        default=None,
+        help="JSON file holding an inline effect chain (a list of stages)",
+    )
     ap.add_argument(
         "--host",
         default=DEFAULT_HOST,
@@ -74,6 +87,15 @@ def main() -> int:
         payload["voice"] = args.voice
     if args.speed is not None:
         payload["speed"] = args.speed
+    if args.effect:
+        payload["effect"] = args.effect
+    elif args.effect_file:
+        try:
+            with open(args.effect_file, encoding="utf-8") as f:
+                payload["effect"] = json.load(f)
+        except (OSError, ValueError) as e:
+            print(f"BAD_REQUEST local cannot read --effect-file: {e}")
+            return 2
 
     try:
         r = requests.post(f"{base_url}{ENDPOINT}", json=payload, timeout=10)
@@ -95,6 +117,8 @@ def main() -> int:
         err = body.get("error", "unknown error")
         voices = body.get("valid_voices")
         extra = f" valid_voices={voices}" if voices else ""
+        effects = body.get("valid_effects")
+        extra += f" valid_effects={effects}" if effects else ""
         print(f"BAD_REQUEST 400 {err}{extra}")
         return 2
 
