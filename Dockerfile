@@ -11,10 +11,16 @@ FROM python:3.11-slim
 # pulseaudio-utils gives us `paplay` for playback through the host's PulseAudio
 # server; espeak-ng is used by Kokoro as a fallback phonemizer for
 # out-of-dictionary words.
+#
+# libatomic1 is required at runtime by pedalboard's native extension on some
+# architectures (notably arm64); python:3.11-slim doesn't ship it, and
+# without it `import pedalboard` fails with "libatomic.so.1: cannot open
+# shared object file".
 RUN apt-get update && apt-get install -y --no-install-recommends \
     pulseaudio-utils \
     espeak-ng \
     libsndfile1 \
+    libatomic1 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -27,9 +33,15 @@ RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/wh
 # Kokoro's Python package + Flask for the API, from regular PyPI.
 # NOTE: "kokoro>=0.7.9" must be quoted — unquoted, the shell interprets the
 # unescaped '>' as output redirection instead of a version specifier.
+# pedalboard (Spotify's audio effects library) powers the optional "effect"
+# request field; see effects.py. It needs libatomic1 from apt (installed
+# above). scipy provides the filter and solver behind the "monotone"
+# effect stage.
 RUN pip install --no-cache-dir \
     flask \
     "kokoro>=0.7.9" \
+    "pedalboard>=0.9" \
+    scipy \
     soundfile
 
 # Kokoro's English g2p (misaki) lazily downloads the spaCy "en_core_web_sm"
@@ -75,7 +87,16 @@ voices_b = ['bf_emma', 'bm_george']; \
 [list(pipeline_b('Hello world', voice=v)) for v in voices_b]" \
     && chmod -R 777 /tmp/huggingface /tmp/torchinductor
 
+# Fail the build, not the container start, if an effects dependency's
+# native extension can't load (e.g. a missing shared library).
+RUN python3 -c "import pedalboard, scipy.linalg, scipy.signal; print('pedalboard', pedalboard.__version__, 'scipy', scipy.__version__)"
+
+COPY effects.py /app/effects.py
 COPY server.py /app/server.py
+
+# Optional operator-defined effect presets. run.sh mounts ./effects.json
+# here if it exists; if nothing is mounted, only the built-ins are offered.
+ENV KOKORO_EFFECTS_FILE=/config/effects.json
 
 ENV PULSE_SERVER=unix:/tmp/pulse-socket
 

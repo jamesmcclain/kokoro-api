@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Discipline 4 only: append one utterance to the unguaranteed playback queue.
+"""Discipline 1 (the default): append one text to the unguaranteed playback queue.
 
 Submits to POST /queue_with_no_guarantee_of_playing and returns at once. The
 text is played in arrival order, after whatever is already ahead of it.
@@ -15,6 +15,18 @@ so you can pace your next submission. They say nothing about earlier ones.
 Usage:
     queue_ordered_speech_no_guarantee.py "Step three of six is complete."
     queue_ordered_speech_no_guarantee.py --file /tmp/update.txt --voice am_onyx
+    queue_ordered_speech_no_guarantee.py "Build finished." --effect radio
+    queue_ordered_speech_no_guarantee.py "Hello." --host 192.168.1.33
+
+The server host defaults to $KOKORO_HOST (or 10.0.2.2 if that is unset) and
+the port defaults to $KOKORO_PORT (or 5001). Override either per-call with
+--host/--port, or export the environment variables once for a whole session.
+
+SPEAKER CHECK: run check_speaker.py ONE time per task, before the first
+queue call. Do not run it again in that task. This script prints
+queue_entries and queue_seconds after every call. Those two numbers are the
+queue status. Use them to pace the next call. The QUEUED and REJECTED lines
+end with "no_speaker_check_needed" as a reminder of this rule.
 
 Exit codes:
     0  -> 202, accepted into the queue (NOT a promise that it plays)
@@ -23,11 +35,14 @@ Exit codes:
     3  -> network/other error
 """
 import argparse
+import json
+import os
 import sys
 
 import requests
 
-BASE_URL = "http://10.0.2.2:5001"
+DEFAULT_HOST = os.environ.get("KOKORO_HOST", "10.0.2.2")
+DEFAULT_PORT = os.environ.get("KOKORO_PORT", "5001")
 ENDPOINT = "/queue_with_no_guarantee_of_playing"
 
 
@@ -37,7 +52,29 @@ def main() -> int:
     ap.add_argument("--file", help="Read text from this file instead")
     ap.add_argument("--voice", default=None)
     ap.add_argument("--speed", type=float, default=None)
+    effect_group = ap.add_mutually_exclusive_group()
+    effect_group.add_argument(
+        "--effect",
+        default=None,
+        help="Effect preset name (see list_effects.py), e.g. audiobook",
+    )
+    effect_group.add_argument(
+        "--effect-file",
+        default=None,
+        help="JSON file holding an inline effect chain (a list of stages)",
+    )
+    ap.add_argument(
+        "--host",
+        default=DEFAULT_HOST,
+        help=f"Server hostname or IP (default: {DEFAULT_HOST}, or $KOKORO_HOST)",
+    )
+    ap.add_argument(
+        "--port",
+        default=DEFAULT_PORT,
+        help=f"Server port (default: {DEFAULT_PORT}, or $KOKORO_PORT)",
+    )
     args = ap.parse_args()
+    base_url = f"http://{args.host}:{args.port}"
 
     if args.file:
         text = open(args.file, encoding="utf-8").read()
@@ -51,9 +88,18 @@ def main() -> int:
         payload["voice"] = args.voice
     if args.speed is not None:
         payload["speed"] = args.speed
+    if args.effect:
+        payload["effect"] = args.effect
+    elif args.effect_file:
+        try:
+            with open(args.effect_file, encoding="utf-8") as f:
+                payload["effect"] = json.load(f)
+        except (OSError, ValueError) as e:
+            print(f"BAD_REQUEST local cannot read --effect-file: {e}")
+            return 2
 
     try:
-        r = requests.post(f"{BASE_URL}{ENDPOINT}", json=payload, timeout=10)
+        r = requests.post(f"{base_url}{ENDPOINT}", json=payload, timeout=10)
     except requests.RequestException as e:
         print(f"ERROR request failed: {e}")
         return 3
@@ -63,15 +109,17 @@ def main() -> int:
     seconds = body.get("queue_seconds")
 
     if r.status_code == 202:
-        print(f"QUEUED queue_entries={entries} queue_seconds={seconds}")
+        print(f"QUEUED queue_entries={entries} queue_seconds={seconds} no_speaker_check_needed")
         return 0
     if r.status_code == 503:
-        print(f"REJECTED queue_full queue_entries={entries} queue_seconds={seconds}")
+        print(f"REJECTED queue_full queue_entries={entries} queue_seconds={seconds} no_speaker_check_needed")
         return 1
     if r.status_code == 400:
         err = body.get("error", "unknown error")
         voices = body.get("valid_voices")
         extra = f" valid_voices={voices}" if voices else ""
+        effects = body.get("valid_effects")
+        extra += f" valid_effects={effects}" if effects else ""
         print(f"BAD_REQUEST 400 {err}{extra}")
         return 2
 

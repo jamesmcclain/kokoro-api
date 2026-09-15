@@ -26,6 +26,16 @@
 #     -H "Content-Type: application/json" \
 #     -d '{"text": "Hello as a file.", "voice": "af_heart", "play": false}' \
 #     -o output.wav
+#
+# Apply an effect preset (list them with: curl http://localhost:5001/effects):
+#   curl -X POST http://localhost:5001/speak \
+#     -H "Content-Type: application/json" \
+#     -d '{"text": "Chapter one.", "voice": "bm_george", "effect": "audiobook"}'
+#
+# Custom presets: if an effects.json file sits next to this script, it is
+# mounted read-only into the container and its presets are added to (or
+# override) the built-ins. See effects.example.json for the format. The
+# server validates it at startup and refuses to start if it's malformed.
 
 set -euo pipefail
 
@@ -33,6 +43,9 @@ IMAGE_NAME="kokoro-speaker"
 CONTAINER_NAME="kokoro-speaker"
 HOST_PORT=5001
 CONTAINER_PORT=5001
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+EFFECTS_FILE="${SCRIPT_DIR}/effects.json"
 
 PULSE_SOCKET="/run/user/$(id -u)/pulse/native"
 PULSE_COOKIE="${HOME}/.config/pulse/cookie"
@@ -55,6 +68,10 @@ fi
 MOUNT_ARGS=(
     -v "${PULSE_SOCKET}:/tmp/pulse-socket"
 )
+
+if [ -f "${EFFECTS_FILE}" ]; then
+    MOUNT_ARGS+=(-v "${EFFECTS_FILE}:/config/effects.json:ro")
+fi
 
 # Only mount the cookie if it exists; some setups don't require it for
 # local Unix-socket connections owned by the same UID.

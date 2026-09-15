@@ -39,6 +39,15 @@ nor can it fail with 409.
 
 Endpoints:
   GET  /health   -> {"status": "ok"}
+  GET  /effects  -> {
+                      "presets": [{"name", "source", "summary", "stages"}, ...],
+                      "stage_types": {type: {param: {"default","min","max"}}},
+                      "max_stages": <integer>
+                    }
+                  Everything a caller needs to pick a preset or build an
+                  inline chain. "summary" is a short human-readable label
+                  per stage (e.g. "HP 85Hz", "Comp -22dB 3:1"). "source" is
+                  "built-in" or "user" (see KOKORO_EFFECTS_FILE below).
   GET  /speaker  -> {
                       "busy": true|false,
                       "queue_entries": <integer>,
@@ -60,6 +69,7 @@ Endpoints:
                      "text": "...",           (required)
                      "voice": "af_heart",     (optional, default af_heart)
                      "speed": 1.0,            (optional, default 1.0, range 0.1-3.0)
+                     "effect": "audiobook",   (optional, default none; see Effects)
                      "play": true             (optional, default true)
                    }
                   play=true — speak through the host speaker,
@@ -97,7 +107,8 @@ Endpoints:
                   body: {
                      "text": "...",           (required)
                      "voice": "af_heart",     (optional, default af_heart)
-                     "speed": 1.0             (optional, default 1.0, range 0.1-3.0)
+                     "speed": 1.0,            (optional, default 1.0, range 0.1-3.0)
+                     "effect": "audiobook"    (optional, default none; see Effects)
                    }
                   Appends the utterance to the playback queue and returns
                   202 immediately. The endpoint name is the contract: there
@@ -114,10 +125,31 @@ Endpoints:
                   text was NOT accepted. There is no "play" field here;
                   sending one is a 400, since this endpoint always plays
                   and never returns audio.
+
+Effects:
+  "effect" applies post-synthesis audio processing, in either form:
+    "effect": "8-bit"                               a preset (case-insensitive;
+                                                    "Vintage radio" also
+                                                    matches "vintage-radio")
+    "effect": [{"type": "highpass", "cutoff_hz": 85},
+               {"type": "reverb", "wet": 0.1}]      an inline chain
+  Omitting it, null, "none", or [] all mean no effect. Invalid values are a
+  400 with the reason (and "valid_effects" for an unknown preset name).
+  GET /effects lists presets and every stage type with its parameter
+  ranges. Effects never change the speaker, queue, or play/download
+  contracts above; reverb and delay tails are included in the audio and in
+  the duration estimates.
+
+  Operators can add presets, or override built-ins by name, without
+  rebuilding the image: put {"name": [stage, ...], ...} in a JSON file at
+  KOKORO_EFFECTS_FILE (default /config/effects.json; run.sh mounts
+  ./effects.json there if it exists). The file is validated at startup, and
+  a malformed one stops the server rather than failing request by request.
 """
 
 import collections
 import io
+import os
 import subprocess
 import threading
 import time
@@ -126,6 +158,8 @@ import numpy as np
 import soundfile as sf
 from flask import Flask, request, send_file, jsonify
 from kokoro import KPipeline
+
+from effects import EffectError, EffectRegistry
 
 app = Flask(__name__)
 
@@ -166,6 +200,11 @@ _pipelines["a"] = KPipeline(lang_code="a")
 
 DEFAULT_VOICE = "af_heart"
 SAMPLE_RATE = 24000
+
+# Loaded once at startup; raises (and so stops the server) if the operator's
+# presets file is malformed.
+EFFECTS_FILE = os.environ.get("KOKORO_EFFECTS_FILE", "/config/effects.json")
+EFFECTS = EffectRegistry(EFFECTS_FILE)
 
 # Rough average speaking rate for Kokoro's English voices at speed=1.0,
 # used only to produce an *estimate* of audio duration before synthesis
@@ -231,13 +270,19 @@ def _update_rtf_estimate(render_seconds, audio_duration_seconds):
         )
 
 
-def _estimate_total_duration(text, speed):
+def _estimate_total_duration(text, speed, chain=None):
     """Estimated seconds from 'now' until an utterance of this text has
     finished playing: estimated playback time (word count at a typical
-    speaking rate, scaled by speed) plus estimated rendering time (the
-    rolling RTF measured on this server). A ballpark, not a guarantee."""
+    speaking rate, scaled by speed, plus any effect tail such as reverb)
+    plus estimated rendering time (the rolling RTF measured on this
+    server, which already absorbs effect processing cost). A ballpark, not
+    a guarantee."""
     word_count = len(text.split())
+    if chain is not None:
+        speed = chain.effective_speed(speed)
     estimated_playback = (word_count / WORDS_PER_MINUTE) * 60 / speed
+    if chain is not None:
+        estimated_playback += chain.tail_seconds
     estimated_rendering = estimated_playback * _get_rtf_estimate()
     return round(estimated_playback + estimated_rendering, 1)
 
@@ -361,20 +406,20 @@ def _queue_snapshot():
         return len(_queue), round(_queued_seconds, 1)
 
 
-def _try_enqueue(text, voice, speed):
+def _try_enqueue(text, voice, speed, chain):
     """Appends one utterance if there is room. Returns (accepted, entries,
     seconds) describing the queue after the decision. Rejection is the only
     signal this endpoint ever gives a caller, so it happens here, up front,
     while the caller is still listening."""
     global _queued_seconds
-    estimated_duration = _estimate_total_duration(text, speed)
+    estimated_duration = _estimate_total_duration(text, speed, chain)
     with _queue_lock:
         full = (
             len(_queue) >= MAX_QUEUE_ENTRIES
             or _queued_seconds + estimated_duration > MAX_QUEUE_SECONDS
         )
         if not full:
-            _queue.append((text, voice, speed, estimated_duration))
+            _queue.append((text, voice, speed, chain, estimated_duration))
             _queued_seconds += estimated_duration
             _queue_lock.notify()
         return (not full), len(_queue), round(_queued_seconds, 1)
@@ -401,12 +446,12 @@ def _queue_worker():
             _speaker_mutex.acquire()
             try:
                 with _queue_lock:
-                    text, voice, speed, estimated_duration = _queue.popleft()
+                    text, voice, speed, chain, estimated_duration = _queue.popleft()
                     _queued_seconds = max(_queued_seconds - estimated_duration, 0.0)
                 with _speaker_state_lock:
                     _speaker_busy_until = time.monotonic() + estimated_duration
                 try:
-                    _run_pipeline(text, voice, speed, play=True)
+                    _run_pipeline(text, voice, speed, play=True, chain=chain)
                 except Exception as e:
                     app.logger.error("queued synthesis failed for voice=%s: %s", voice, e)
             finally:
@@ -438,7 +483,7 @@ def _open_paplay_stream():
         return None
 
 
-def _run_pipeline(text, voice, speed, play):
+def _run_pipeline(text, voice, speed, play, chain=None):
     """Synthesizes with Kokoro chunk-by-chunk. If play is True, each
     chunk is streamed to a live `paplay` process as soon as it's
     produced, so playback of chunk N starts while chunk N+1 is still
@@ -452,6 +497,10 @@ def _run_pipeline(text, voice, speed, play):
     Callers that pass play=True must already hold the speaker mutex;
     this function itself neither claims nor releases it.
 
+    If chain is given, each chunk passes through a fresh EffectProcessor
+    before it is played or kept, and the effect tail (reverb, delay) is
+    flushed after the last chunk, so the speaker and the WAV both get it.
+
     Measures total wall-clock render time and feeds it into the rolling
     RTF estimate used for future duration estimates. Returns the
     concatenated audio array (still needed for return_audio and for the
@@ -459,20 +508,36 @@ def _run_pipeline(text, voice, speed, play):
     audio."""
     paplay_proc = _open_paplay_stream() if play else None
     pipeline = _get_pipeline(voice)
+    processor = chain.new_processor(SAMPLE_RATE) if chain is not None else None
+    if chain is not None:
+        # Tempo stages change the rate Kokoro speaks at, not the audio.
+        speed = chain.effective_speed(speed)
 
     start = time.time()
     audio_chunks = []
+
+    def emit(samples):
+        nonlocal paplay_proc
+        if len(samples) == 0:
+            return
+        audio_chunks.append(samples)
+        if paplay_proc is not None:
+            try:
+                paplay_proc.stdin.write(samples.tobytes())
+            except (BrokenPipeError, OSError) as e:
+                app.logger.warning("paplay write failed: %s", e)
+                paplay_proc = None
+
     try:
         for _, _, audio in pipeline(text, voice=voice, speed=speed):
-            audio_chunks.append(audio)
-            if paplay_proc is not None:
-                try:
-                    paplay_proc.stdin.write(
-                        np.asarray(audio, dtype=np.float32).tobytes()
-                    )
-                except (BrokenPipeError, OSError) as e:
-                    app.logger.warning("paplay write failed: %s", e)
-                    paplay_proc = None
+            if audio is None:
+                continue
+            samples = np.asarray(audio, dtype=np.float32)
+            if processor is not None:
+                samples = processor.process(samples)
+            emit(samples)
+        if processor is not None and audio_chunks:
+            emit(processor.flush())
     finally:
         if paplay_proc is not None:
             try:
@@ -491,7 +556,7 @@ def _run_pipeline(text, voice, speed, play):
     return full_audio
 
 
-def _synthesize_and_play(text, voice, speed):
+def _synthesize_and_play(text, voice, speed, chain):
     """Runs in a background thread with the speaker mutex already held by
     the request handler that spawned it: synthesizes with Kokoro,
     streaming each chunk to paplay as it's produced. Releases the speaker
@@ -500,7 +565,7 @@ def _synthesize_and_play(text, voice, speed):
     forever. Any failure here is only logged, since the HTTP response has
     already been sent."""
     try:
-        _run_pipeline(text, voice, speed, play=True)
+        _run_pipeline(text, voice, speed, play=True, chain=chain)
     except Exception as e:
         app.logger.error("synthesis failed for voice=%s: %s", voice, e)
     finally:
@@ -510,6 +575,13 @@ def _synthesize_and_play(text, voice, speed):
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"})
+
+
+@app.route("/effects", methods=["GET"])
+def effects():
+    """Presets (built-in and operator-defined) and the stage schema for
+    building inline chains."""
+    return jsonify(EFFECTS.describe())
 
 
 @app.route("/speaker", methods=["GET"])
@@ -543,6 +615,27 @@ def _validate_speech_params(text, voice, speed):
     return None
 
 
+def _effect_label(chain):
+    """What a 202 body reports under "effect": the preset name, "custom"
+    for an inline chain, or null."""
+    if chain is None:
+        return None
+    return chain.name or "custom"
+
+
+def _resolve_effect(payload):
+    """Returns (chain, None) on success — chain is None for "no effect" — or
+    (None, (body, status)) for a 400. Shared by both playback endpoints and
+    by WAV download so they can't disagree about what's valid."""
+    try:
+        return EFFECTS.resolve(payload.get("effect")), None
+    except EffectError as e:
+        body = {"error": str(e)}
+        if isinstance(payload.get("effect"), str):
+            body["valid_effects"] = EFFECTS.names()
+        return None, (body, 400)
+
+
 @app.route("/queue_with_no_guarantee_of_playing", methods=["POST"])
 def queue_with_no_guarantee_of_playing():
     """Appends an utterance to the playback queue, or rejects it because
@@ -569,7 +662,12 @@ def queue_with_no_guarantee_of_playing():
         body, status = invalid
         return jsonify(body), status
 
-    accepted, queue_entries, queue_seconds = _try_enqueue(text, voice, speed)
+    chain, invalid = _resolve_effect(payload)
+    if invalid is not None:
+        body, status = invalid
+        return jsonify(body), status
+
+    accepted, queue_entries, queue_seconds = _try_enqueue(text, voice, speed, chain)
     if not accepted:
         return jsonify({
             "error": "queue is full",
@@ -579,6 +677,7 @@ def queue_with_no_guarantee_of_playing():
     return jsonify({
         "status": "queued",
         "voice": voice,
+        "effect": _effect_label(chain),
         "queue_entries": queue_entries,
         "queue_seconds": queue_seconds,
     }), 202
@@ -618,6 +717,10 @@ def speak():
         return jsonify(body), status
     if not isinstance(play, bool):
         return jsonify({"error": "'play' must be a boolean"}), 400
+    chain, invalid = _resolve_effect(payload)
+    if invalid is not None:
+        body, status = invalid
+        return jsonify(body), status
 
     if play:
         # Asynchronous playback. The speaker must be claimed *now*, in
@@ -625,7 +728,7 @@ def speak():
         # immediate failure instead of overlapping audio or an invisible
         # queue. The non-blocking acquire is the arbiter when two
         # requests race.
-        estimated_duration = _estimate_total_duration(text, speed)
+        estimated_duration = _estimate_total_duration(text, speed, chain)
         if not _try_claim_speaker(estimated_duration):
             _, _, seconds_until_free = _speaker_status()
             return jsonify({
@@ -640,7 +743,7 @@ def speak():
         try:
             threading.Thread(
                 target=_synthesize_and_play,
-                args=(text, voice, speed),
+                args=(text, voice, speed, chain),
                 daemon=True,
             ).start()
         except Exception:
@@ -649,6 +752,7 @@ def speak():
         return jsonify({
             "status": "accepted",
             "voice": voice,
+            "effect": _effect_label(chain),
             "played": True,
             "estimated_duration_seconds": estimated_duration,
         }), 202
@@ -657,7 +761,7 @@ def speak():
     # returns the audio bytes. Never touches the speaker, so it neither
     # takes the mutex nor competes with playback.
     try:
-        full_audio = _run_pipeline(text, voice, speed, play=False)
+        full_audio = _run_pipeline(text, voice, speed, play=False, chain=chain)
     except RuntimeError:
         return jsonify({"error": "synthesis produced no audio"}), 500
 
