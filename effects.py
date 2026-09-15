@@ -1136,8 +1136,30 @@ _PROBE_OVERRIDES = {"bitcrush": {"downsample": 8}}
 _SIMULATE_CRASH_ENV = "KOKORO_EFFECTS_SIMULATE_CRASH"
 
 
+def _simulated_crashes():
+    return set(filter(None, os.environ.get(_SIMULATE_CRASH_ENV, "").split(",")))
+
+
+def _probe_import_worker():
+    """Child process: just import pedalboard. ("import" in the simulate
+    list fakes a crash here.)"""
+    if "import" in _simulated_crashes():
+        os.kill(os.getpid(), signal.SIGILL)
+    _pedalboard()
+    print("OK import", flush=True)
+
+
+def _describe_exit(code):
+    if isinstance(code, int) and code < 0:
+        try:
+            return signal.Signals(-code).name
+        except ValueError:
+            return f"signal {-code}"
+    return f"exit {code}"
+
+
 def _probe_worker(stage_types):
-    simulated = set(filter(None, os.environ.get(_SIMULATE_CRASH_ENV, "").split(",")))
+    simulated = _simulated_crashes()
     sample_rate = 24000
     tone = (0.3 * np.sin(np.arange(6000) * 0.06)).astype(np.float32)
     for stage_type in stage_types:
@@ -1157,6 +1179,25 @@ def probe_stage_types(timeout=120):
     type to how its child process ended."""
     remaining = list(STAGE_SPECS)
     unsupported = {}
+
+    # Step 1: can pedalboard even be imported? If not, every stage type
+    # that needs it is out, without spawning one crashing child per type.
+    try:
+        proc = subprocess.run(
+            [sys.executable, os.path.abspath(__file__), "--probe-import"],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        import_ok = proc.returncode == 0 and "OK import" in proc.stdout
+        how = _describe_exit(proc.returncode)
+    except subprocess.TimeoutExpired:
+        import_ok, how = False, "timeout"
+    if not import_ok:
+        for stage_type in remaining:
+            if stage_type not in _NUMPY_STAGE_TYPES:
+                unsupported[stage_type] = f"import pedalboard: {how}"
+        remaining = [t for t in remaining if t in _NUMPY_STAGE_TYPES]
+
+    # Step 2: run each remaining stage type.
     while remaining:
         try:
             proc = subprocess.run(
@@ -1175,14 +1216,7 @@ def probe_stage_types(timeout=120):
         # The child died (or hung) on the last type it started. If it died
         # before starting any type, blame the first remaining one.
         culprit = started[-1] if started and started[-1] in remaining else remaining[0]
-        if isinstance(code, int) and code < 0:
-            try:
-                how = signal.Signals(-code).name
-            except ValueError:
-                how = f"signal {-code}"
-        else:
-            how = f"exit {code}"
-        unsupported[culprit] = how
+        unsupported[culprit] = _describe_exit(code)
         remaining.remove(culprit)
     return set(unsupported), unsupported
 
@@ -1214,13 +1248,17 @@ def self_test():
     """Printed during the image build. Always exits 0 unless effects.py
     itself is broken: an unsupported stage disables effects that use it,
     it doesn't stop the build."""
+    # Never import pedalboard in this process: on an affected CPU the
+    # import alone kills the process. Flush every line, so nothing is lost
+    # if something else does crash.
     registry = EffectRegistry()
-    print(cpu_report())
+    print(cpu_report(), flush=True)
+    from importlib import metadata
     try:
-        version = _pedalboard().__version__
-    except Exception as e:  # noqa: BLE001 - report, don't fail
-        version = f"import failed: {e}"
-    print(f"pedalboard: {version}")
+        version = metadata.version("pedalboard")
+    except metadata.PackageNotFoundError:
+        version = "not installed"
+    print(f"pedalboard: {version}  numpy: {np.__version__}", flush=True)
     unsupported, details = probe_stage_types()
     if not unsupported:
         print(f"effects self-test: all {len(STAGE_SPECS)} stage types work; "
@@ -1232,12 +1270,14 @@ def self_test():
         print(f"  {stage_type}: {details[stage_type]}")
     available = registry.available_names()
     print(f"presets still available ({len(available)}/{len(registry.names())}): "
-          + (", ".join(available) or "none"))
+          + (", ".join(available) or "none"), flush=True)
 
 
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--probe-worker":
         _probe_worker(sys.argv[2:])
+    elif sys.argv[1:] == ["--probe-import"]:
+        _probe_import_worker()
     elif sys.argv[1:] == ["--self-test"]:
         self_test()
     else:
