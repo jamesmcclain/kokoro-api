@@ -88,10 +88,13 @@ voices_b = ['bf_emma', 'bm_george']; \
 
 COPY effects.py /app/effects.py
 
-# Fail the build, not the container start, if the effects code or one of
-# its native dependencies can't load on this CPU (missing shared library,
-# illegal instruction). Runs every built-in preset over a short test tone.
-RUN python3 -c "import numpy as np, effects; r = effects.EffectRegistry(); x = (0.3 * np.sin(np.arange(24000) * 0.06)).astype(np.float32); [(lambda p: (p.process(x), p.flush()))(r.resolve(n).new_processor(24000)) for n in r.names()]; print('effects OK:', len(r.names()), 'presets')"
+# Report which effect stage types work on this CPU. Each stage type runs in
+# its own child process, so one that dies with "Illegal instruction" is
+# listed, not fatal: the server repeats this probe at startup and disables
+# those stage types (and the presets that use them). The build fails here
+# only if effects.py itself is broken. Use `docker build --progress=plain`
+# to see the report.
+RUN python3 effects.py --self-test
 COPY server.py /app/server.py
 
 # Optional operator-defined effect presets. run.sh mounts ./effects.json

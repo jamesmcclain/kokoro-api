@@ -140,6 +140,12 @@ Effects:
   contracts above; reverb and delay tails are included in the audio and in
   the duration estimates.
 
+  At startup the server runs every effect stage type once in a child
+  process. A stage type whose native code crashes on this CPU ("Illegal
+  instruction") is disabled: requests that use it get a 400 that says so,
+  and GET /effects marks each affected preset "available": false. Set
+  KOKORO_EFFECTS_PROBE=0 to skip the probe.
+
   Operators can add presets, or override built-ins by name, without
   rebuilding the image: put {"name": [stage, ...], ...} in a JSON file at
   KOKORO_EFFECTS_FILE (default /config/effects.json; run.sh mounts
@@ -151,6 +157,7 @@ import collections
 import io
 import os
 import subprocess
+import sys
 import threading
 import time
 
@@ -159,7 +166,7 @@ import soundfile as sf
 from flask import Flask, request, send_file, jsonify
 from kokoro import KPipeline
 
-from effects import EffectError, EffectRegistry
+from effects import EffectError, EffectRegistry, cpu_report, probe_stage_types
 
 app = Flask(__name__)
 
@@ -204,7 +211,27 @@ SAMPLE_RATE = 24000
 # Loaded once at startup; raises (and so stops the server) if the operator's
 # presets file is malformed.
 EFFECTS_FILE = os.environ.get("KOKORO_EFFECTS_FILE", "/config/effects.json")
-EFFECTS = EffectRegistry(EFFECTS_FILE)
+
+
+def _probe_effects():
+    """Stage types whose native code crashes on this CPU (see
+    effects.probe_stage_types). Takes well under a second per stage type,
+    once, at startup. Set KOKORO_EFFECTS_PROBE=0 to skip it and trust every
+    stage type."""
+    if os.environ.get("KOKORO_EFFECTS_PROBE", "1") == "0":
+        return set()
+    unsupported, details = probe_stage_types()
+    if unsupported:
+        print(
+            "WARNING: effect stage types disabled because they crash on this CPU: "
+            + ", ".join(f"{t} ({details[t]})" for t in sorted(details))
+            + f" [{cpu_report()}]",
+            file=sys.stderr, flush=True,
+        )
+    return unsupported
+
+
+EFFECTS = EffectRegistry(EFFECTS_FILE, unsupported=_probe_effects())
 
 # Rough average speaking rate for Kokoro's English voices at speed=1.0,
 # used only to produce an *estimate* of audio duration before synthesis
@@ -632,7 +659,7 @@ def _resolve_effect(payload):
     except EffectError as e:
         body = {"error": str(e)}
         if isinstance(payload.get("effect"), str):
-            body["valid_effects"] = EFFECTS.names()
+            body["valid_effects"] = EFFECTS.available_names()
         return None, (body, 400)
 
 

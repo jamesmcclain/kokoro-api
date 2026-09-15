@@ -46,9 +46,14 @@ import json
 import math
 import os
 import re
+import signal
+import subprocess
+import sys
 
 import numpy as np
-import pedalboard as pb
+
+# pedalboard is imported lazily (see _pedalboard()) so that a CPU that
+# can't run its native code still gets the numpy-only stages.
 
 MAX_STAGES = 16
 
@@ -73,6 +78,11 @@ _MAX_FILTER_HZ = 11500.0
 # clamped into this range after multiplying.
 _MIN_SPEED = 0.1
 _MAX_SPEED = 3.0
+
+
+def _pedalboard():
+    import pedalboard
+    return pedalboard
 
 
 # --- Stage schema ---------------------------------------------------------
@@ -540,9 +550,14 @@ def load_user_presets(path):
 
 class EffectRegistry:
     """Holds the validated presets. User presets override built-ins with
-    the same name (compared via canonical_name)."""
+    the same name (compared via canonical_name).
 
-    def __init__(self, user_presets_path=None):
+    unsupported: stage types that don't run on this machine (see
+    probe_stage_types()). Chains that use them are refused with a clear
+    message, and /effects marks the affected presets unavailable."""
+
+    def __init__(self, user_presets_path=None, unsupported=()):
+        self.unsupported = frozenset(unsupported)
         self._presets = {}
         self._sources = {}
         for name, stages in BUILTIN_PRESETS.items():
@@ -554,6 +569,17 @@ class EffectRegistry:
 
     def names(self):
         return sorted(self._presets)
+
+    def _blocked(self, stages):
+        return sorted({s["type"] for s in stages} & self.unsupported)
+
+    def _require_supported(self, stages, what):
+        blocked = self._blocked(stages)
+        if blocked:
+            raise EffectError(
+                f"{what} uses stage type(s) {blocked}, which crash on this "
+                "server's CPU and are disabled; choose another effect"
+            )
 
     def resolve(self, effect):
         """Turns a request's 'effect' value into an EffectChain, or None for
@@ -567,9 +593,14 @@ class EffectRegistry:
             stages = self._presets.get(key)
             if stages is None:
                 raise EffectError(f"unknown effect preset '{effect}'")
+            self._require_supported(stages, f"effect preset '{key}'")
             return EffectChain(stages, name=key)
         stages = validate_chain(effect)
+        self._require_supported(stages, "effect")
         return EffectChain(stages, name=None) if stages else None
+
+    def available_names(self):
+        return [n for n in self.names() if not self._blocked(self._presets[n])]
 
     def describe(self):
         """JSON-ready description for GET /effects."""
@@ -580,9 +611,12 @@ class EffectRegistry:
                     "source": self._sources[name],
                     "summary": [stage_label(s) for s in self._presets[name]],
                     "stages": self._presets[name],
+                    "available": not self._blocked(self._presets[name]),
+                    "unavailable_stages": self._blocked(self._presets[name]),
                 }
                 for name in self.names()
             ],
+            "unsupported_stage_types": sorted(self.unsupported),
             "stage_types": {
                 t: {
                     p: {"default": d, "min": lo, "max": hi}
@@ -640,6 +674,12 @@ class EffectChain:
 # whatever a stage is still holding.
 
 _EMPTY = np.zeros(0, dtype=np.float32)
+
+
+# Stage types implemented in numpy alone; everything else uses pedalboard.
+_NUMPY_STAGE_TYPES = frozenset({
+    "volume", "tempo", "monotone", "tremolo", "ring", "overdrive",
+})
 
 
 class _Stage:
@@ -922,11 +962,15 @@ class _MonotoneStage(_Stage):
 
 
 def _pb_chain(plugins):
-    return plugins[0] if len(plugins) == 1 else pb.Pedalboard(plugins)
+    return plugins[0] if len(plugins) == 1 else _pedalboard().Pedalboard(plugins)
 
 
 def _build_stage(stage, sample_rate):
     t = stage["type"]
+    if t in _NUMPY_STAGE_TYPES:
+        pb = None
+    else:
+        pb = _pedalboard()
     pedal = lambda plugin, **kw: _PedalboardStage(plugin, sample_rate, **kw)
     if t == "highpass":
         return pedal(pb.HighpassFilter(cutoff_frequency_hz=stage["cutoff_hz"]))
@@ -1071,3 +1115,130 @@ class EffectProcessor:
                 out = out.copy()
                 out[-fade:] *= np.linspace(1.0, 0.0, fade, dtype=np.float32)
         return out
+
+
+# --- CPU support probe ----------------------------------------------------
+#
+# pedalboard ships prebuilt native code. On some CPUs part of that code
+# uses instructions the processor lacks, and the whole Python process dies
+# with SIGILL ("Illegal instruction") the first time the code runs; no
+# exception is raised, so it can't be caught in-process. The probe runs
+# every stage type in a child process instead: the child reports each
+# type it finishes, and when it dies, the type it was working on is marked
+# unsupported and a fresh child continues with the rest.
+
+# A representative configuration per stage type. bitcrush is probed with
+# downsampling on, so the resampler is exercised too.
+_PROBE_OVERRIDES = {"bitcrush": {"downsample": 8}}
+
+# Test hook: comma-separated stage types the probe child kills itself on,
+# as if they had crashed. Lets the fallback path be tested anywhere.
+_SIMULATE_CRASH_ENV = "KOKORO_EFFECTS_SIMULATE_CRASH"
+
+
+def _probe_worker(stage_types):
+    simulated = set(filter(None, os.environ.get(_SIMULATE_CRASH_ENV, "").split(",")))
+    sample_rate = 24000
+    tone = (0.3 * np.sin(np.arange(6000) * 0.06)).astype(np.float32)
+    for stage_type in stage_types:
+        print(f"START {stage_type}", flush=True)
+        if stage_type in simulated:
+            os.kill(os.getpid(), signal.SIGILL)
+        stage = validate_stage({"type": stage_type, **_PROBE_OVERRIDES.get(stage_type, {})})
+        processor = EffectChain([stage]).new_processor(sample_rate)
+        processor.process(tone)
+        processor.process(tone[:1000])
+        processor.flush()
+        print(f"OK {stage_type}", flush=True)
+
+
+def probe_stage_types(timeout=120):
+    """Returns (unsupported_types, details). details maps each unsupported
+    type to how its child process ended."""
+    remaining = list(STAGE_SPECS)
+    unsupported = {}
+    while remaining:
+        try:
+            proc = subprocess.run(
+                [sys.executable, os.path.abspath(__file__), "--probe-worker", *remaining],
+                capture_output=True, text=True, timeout=timeout,
+            )
+            output, code = proc.stdout, proc.returncode
+        except subprocess.TimeoutExpired as e:
+            output = e.stdout.decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
+            code = "timeout"
+        done = {line[3:] for line in output.splitlines() if line.startswith("OK ")}
+        started = [line[6:] for line in output.splitlines() if line.startswith("START ")]
+        remaining = [t for t in remaining if t not in done]
+        if code == 0 and not remaining:
+            break
+        # The child died (or hung) on the last type it started. If it died
+        # before starting any type, blame the first remaining one.
+        culprit = started[-1] if started and started[-1] in remaining else remaining[0]
+        if isinstance(code, int) and code < 0:
+            try:
+                how = signal.Signals(-code).name
+            except ValueError:
+                how = f"signal {-code}"
+        else:
+            how = f"exit {code}"
+        unsupported[culprit] = how
+        remaining.remove(culprit)
+    return set(unsupported), unsupported
+
+
+def cpu_report():
+    """One line naming the CPU and which common SIMD extensions it has."""
+    model, flags = "unknown", set()
+    try:
+        with open("/proc/cpuinfo", encoding="utf-8") as f:
+            for line in f:
+                key, _, value = line.partition(":")
+                key = key.strip()
+                if key in ("model name", "Model", "CPU part") and model == "unknown":
+                    model = value.strip()
+                elif key in ("flags", "Features") and not flags:
+                    flags = set(value.split())
+    except OSError:
+        pass
+    interesting = ["sse4_2", "avx", "avx2", "fma", "bmi2", "avx512f",
+                   "asimd", "sve", "sve2", "sme"]
+    have = [f for f in interesting if f in flags]
+    missing = [f for f in interesting[:6] if flags and f not in flags]
+    import platform
+    return (f"cpu: {platform.machine()} {model}; has {' '.join(have) or 'none'}"
+            + (f"; lacks {' '.join(missing)}" if missing else ""))
+
+
+def self_test():
+    """Printed during the image build. Always exits 0 unless effects.py
+    itself is broken: an unsupported stage disables effects that use it,
+    it doesn't stop the build."""
+    registry = EffectRegistry()
+    print(cpu_report())
+    try:
+        version = _pedalboard().__version__
+    except Exception as e:  # noqa: BLE001 - report, don't fail
+        version = f"import failed: {e}"
+    print(f"pedalboard: {version}")
+    unsupported, details = probe_stage_types()
+    if not unsupported:
+        print(f"effects self-test: all {len(STAGE_SPECS)} stage types work; "
+              f"all {len(registry.names())} presets available")
+        return
+    registry = EffectRegistry(unsupported=unsupported)
+    print("effects self-test: these stage types crash on this CPU and will be disabled:")
+    for stage_type in sorted(details):
+        print(f"  {stage_type}: {details[stage_type]}")
+    available = registry.available_names()
+    print(f"presets still available ({len(available)}/{len(registry.names())}): "
+          + (", ".join(available) or "none"))
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--probe-worker":
+        _probe_worker(sys.argv[2:])
+    elif sys.argv[1:] == ["--self-test"]:
+        self_test()
+    else:
+        sys.exit("usage: effects.py --self-test")
