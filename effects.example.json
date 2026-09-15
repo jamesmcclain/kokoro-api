@@ -10,7 +10,7 @@
     {"type": "bitcrush", "bits": 5},
     {"type": "downsample", "factor": 10}
   ],
-  "walkie-talkie": [
+  "squawk-box": [
     {"type": "highpass", "cutoff_hz": 600},
     {"type": "lowpass", "cutoff_hz": 2800},
     {"type": "distortion", "drive_db": 24},

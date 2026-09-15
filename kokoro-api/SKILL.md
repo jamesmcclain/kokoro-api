@@ -161,13 +161,19 @@ make narration more interesting. The default is no effect.
 
 1. Run `python3 scripts/list_effects.py` one time to get the preset names.
 2. Add `--effect NAME` to the script call. Preset names are not case-sensitive.
+   Spaces, underscores, and hyphens in a name are equal. Thus,
+   `--effect "vintage radio"` and `--effect vintage-radio` select the same
+   preset.
 3. Use the same effect for a whole narration or read-through, unless the user
    asks you to change it. This is the same rule as for the voice.
 
-Built-in presets: `8-bit`, `ai`, `audiobook`, `cathedral`, `chipmunk`, `echo`,
-`giant`, `megaphone`, `radio`, `robot`, `telephone`. The server operator can
-add presets or replace built-in presets. Thus, `list_effects.py` is the
-correct list, not this paragraph.
+Built-in presets: `8-bit`, `ai`, `audiobook`, `broadcaster`, `cathedral`,
+`cave`, `chipmunk`, `cyborg`, `deep`, `dragon`, `echo`, `ethereal`, `giant`,
+`glitch`, `intercom`, `megaphone`, `monotone-female`, `monotone-male`,
+`podcast`, `radio`, `robot`, `stadium`, `telephone`, `trailer`, `underwater`,
+`vintage-radio`, `walkie-talkie`. The server operator can add presets or
+replace built-in presets. Thus, `list_effects.py` is the correct list, not
+this paragraph.
 
 If no preset fits the request, build a custom chain. A chain is a JSON list of
 stages. The server applies the stages in order. Each stage has a `type` and
@@ -184,12 +190,18 @@ JSON
 python3 scripts/queue_ordered_speech_no_guarantee.py "The build finished." --effect-file /tmp/chain.json
 ```
 
-- Stage types: `highpass`, `lowpass`, `eq`, `low_shelf`, `high_shelf`,
-  `compressor`, `gain`, `pitch`, `phaser`, `chorus`, `flanger`, `reverb`,
-  `delay`, `bitcrush`, `downsample`, `distortion`.
+- Stage types: `highpass`, `lowpass`, `band`, `eq`, `bass`, `treble`,
+  `low_shelf`, `high_shelf`, `compressor`, `gain`, `volume`, `pitch`,
+  `tempo`, `monotone`, `phaser`, `chorus`, `flanger`, `tremolo`, `ring`,
+  `reverb`, `delay`, `bitcrush`, `downsample`, `distortion`, `overdrive`.
 - Parameters that you omit get their default values.
-- A pitch stage changes the pitch only. It does not change the speed. Use
-  `--speed` for the speed.
+- A `pitch` stage changes the pitch only. It does not change the speed. The
+  `semitones` parameter uses semitones, but the preset list shows cents.
+  Thus, `Pitch +150` in the list is `"semitones": 1.5` in a chain.
+- A `tempo` stage changes the speed only. It multiplies the `--speed` value.
+- A `monotone` stage removes the speech melody. All speech then has one
+  pitch, at `frequency_hz`.
+- In a `band` stage, `low_hz` must be less than `high_hz`.
 - Reverb and delay add a tail of sound after the last word. The duration
   estimates include this tail.
 - If the server rejects the effect, the script prints `BAD_REQUEST 400` with

@@ -128,7 +128,9 @@ Endpoints:
 
 Effects:
   "effect" applies post-synthesis audio processing, in either form:
-    "effect": "8-bit"                               a preset (case-insensitive)
+    "effect": "8-bit"                               a preset (case-insensitive;
+                                                    "Vintage radio" also
+                                                    matches "vintage-radio")
     "effect": [{"type": "highpass", "cutoff_hz": 85},
                {"type": "reverb", "wet": 0.1}]      an inline chain
   Omitting it, null, "none", or [] all mean no effect. Invalid values are a
@@ -276,6 +278,8 @@ def _estimate_total_duration(text, speed, chain=None):
     server, which already absorbs effect processing cost). A ballpark, not
     a guarantee."""
     word_count = len(text.split())
+    if chain is not None:
+        speed = chain.effective_speed(speed)
     estimated_playback = (word_count / WORDS_PER_MINUTE) * 60 / speed
     if chain is not None:
         estimated_playback += chain.tail_seconds
@@ -505,6 +509,9 @@ def _run_pipeline(text, voice, speed, play, chain=None):
     paplay_proc = _open_paplay_stream() if play else None
     pipeline = _get_pipeline(voice)
     processor = chain.new_processor(SAMPLE_RATE) if chain is not None else None
+    if chain is not None:
+        # Tempo stages change the rate Kokoro speaks at, not the audio.
+        speed = chain.effective_speed(speed)
 
     start = time.time()
     audio_chunks = []
