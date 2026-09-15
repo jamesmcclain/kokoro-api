@@ -49,8 +49,6 @@ import re
 
 import numpy as np
 import pedalboard as pb
-from scipy.linalg import solve_toeplitz
-from scipy.signal import lfilter
 
 MAX_STAGES = 16
 
@@ -763,6 +761,14 @@ class _MonotoneStage(_Stage):
     frame's loudness, and overlap-add. The pulse train is laid on one
     global grid, so pitch periods line up across frames and chunks.
 
+    Pure numpy, on purpose: scipy's bundled math library crashes with
+    "Illegal instruction" on some arm64 CPUs and VMs. The LPC solve is a
+    Levinson-Durbin recursion, and the all-pole synthesis filter (with the
+    de-emphasis filter folded in) is applied in the frequency domain, one
+    FFT per frame, instead of sample by sample. The FFT buffer is long
+    enough for the filter's ringing to die out before it wraps around, and
+    the wrapped part lands in a warm-up region that is thrown away.
+
     The overlap-add needs FRAME - HOP samples of look-ahead, so this stage
     delays audio by 30 ms and holds that much back until flush().
     """
@@ -771,19 +777,24 @@ class _MonotoneStage(_Stage):
     HOP = 240
     ORDER = 24
     WARMUP = 480
+    FFT_SIZE = 4096
     PRE_EMPHASIS = 0.97
 
     def __init__(self, frequency_hz, sample_rate):
         self._sr = sample_rate
         self._period = sample_rate / frequency_hz
         self._window = np.hanning(self.FRAME + 1)[:-1]  # periodic Hann
-        # Periodic Hann at 75% overlap sums to 2.
+        # Periodic Hann at 75% overlap sums to a constant; undo it.
         self._ola_scale = self.HOP / self._window.sum()
         self._min_lag = int(sample_rate / 400)
         self._max_lag = int(sample_rate / 60)
         self._lag_bias = self.FRAME / (self.FRAME - np.arange(self._max_lag + 1))
         self._rng = np.random.default_rng(0)
-        self._deemph_state = np.zeros(1)
+        # z^-k on the FFT grid, for evaluating A(z) and the de-emphasis
+        # filter's denominator at every bin.
+        omega = 2 * np.pi * np.arange(self.FFT_SIZE // 2 + 1) / self.FFT_SIZE
+        self._zinv = np.exp(-1j * np.outer(np.arange(self.ORDER + 1), omega))
+        self._deemphasis = 1.0 - self.PRE_EMPHASIS * self._zinv[1]
         self._pending = []
 
         latency = self.FRAME - self.HOP
@@ -796,6 +807,21 @@ class _MonotoneStage(_Stage):
         self._to_skip = latency
         self._real_in = 0
         self._emitted = 0
+
+    @staticmethod
+    def _levinson(r, order):
+        """LPC coefficients a[0..order] (a[0] = 1) from autocorrelation r,
+        or None if the recursion becomes unstable."""
+        a = np.zeros(order + 1)
+        a[0] = 1.0
+        err = r[0]
+        for i in range(1, order + 1):
+            k = -np.dot(a[:i], r[i:0:-1]) / err
+            a[1:i + 1] = a[1:i + 1] + k * a[i - 1::-1]
+            err *= 1.0 - k * k
+            if err <= 0 or abs(k) >= 1.0:
+                return None
+        return a
 
     def _synth_frame(self, frame, pre, start):
         n = self.FRAME
@@ -812,17 +838,14 @@ class _MonotoneStage(_Stage):
         voicing = float(np.clip((peak - 0.3) / 0.4, 0.0, 1.0))
 
         # LPC envelope from the pre-emphasized frame.
-        pw = pre * w
-        spec = np.fft.rfft(pw, 2 * n)
+        spec = np.fft.rfft(pre * w, 2 * n)
         rp = np.fft.irfft(np.abs(spec) ** 2)[: self.ORDER + 1]
         if rp[0] <= 0:
             return None
         rp[0] *= 1.0001  # white-noise correction for numerical stability
-        try:
-            a = solve_toeplitz(rp[: self.ORDER], -rp[1:])
-        except np.linalg.LinAlgError:
+        a = self._levinson(rp, self.ORDER)
+        if a is None:
             return None
-        denominator = np.concatenate(([1.0], a))
 
         # Excitation over [start - WARMUP, start + FRAME).
         total = self.WARMUP + n
@@ -837,11 +860,15 @@ class _MonotoneStage(_Stage):
         noise = self._rng.standard_normal(total)
         excitation = math.sqrt(voicing) * pulses + math.sqrt(1 - voicing) * noise
 
-        y = lfilter([1.0], denominator, excitation)[self.WARMUP:] * w
+        # Synthesis filter 1 / (A(z) * (1 - 0.97 z^-1)), applied per bin.
+        response = 1.0 / ((a @ self._zinv) * self._deemphasis)
+        y = np.fft.irfft(np.fft.rfft(excitation, self.FFT_SIZE) * response, self.FFT_SIZE)
+        y = y[self.WARMUP:total] * w
+
         y_energy = float(np.dot(y, y))
         if not math.isfinite(y_energy) or y_energy <= 0:
             return None
-        return y * math.sqrt(float(np.dot(pw, pw)) / y_energy)
+        return y * math.sqrt(energy / y_energy)
 
     def _run_frames(self):
         n, hop = self.FRAME, self.HOP
@@ -859,10 +886,9 @@ class _MonotoneStage(_Stage):
             if y is not None:
                 self._acc[:n] += y * self._ola_scale
             # Samples before pos + hop are final: no later frame reaches them.
-            ready = self._acc[:hop]
+            self._pending.append(self._acc[:hop])
             self._acc = self._acc[hop:]
             self._pos += hop
-            self._pending.append(ready)
         drop = self._pos - self._in_off
         if drop > 0:
             self._in_buf = self._in_buf[drop:]
@@ -880,20 +906,15 @@ class _MonotoneStage(_Stage):
         self._emitted += len(out)
         if len(out) == 0:
             return _EMPTY
-        out, self._deemph_state = lfilter(
-            [1.0], [1.0, -self.PRE_EMPHASIS], out, zi=self._deemph_state
-        )
         return out.astype(np.float32)
 
     def process(self, x):
-        self._pending = []
         self._real_in += len(x)
         self._in_buf = np.concatenate([self._in_buf, np.asarray(x, dtype=np.float64)])
         self._run_frames()
         return self._collect()
 
     def flush(self):
-        self._pending = []
         # Pad with silence so every real sample gets its full overlap.
         self._in_buf = np.concatenate([self._in_buf, np.zeros(self.FRAME)])
         self._run_frames()
