@@ -11,10 +11,13 @@ seconds figure covers the whole pipeline: current audio plus every queued
 entry. It never reports whether any particular queued entry was played --
 nothing does.
 
-Call this at most once per wait -- do not loop it. See the skill's Hard
-Rules for why. In Discipline 2 (the default), you normally call this exactly
-once per task, up front, to confirm the server is reachable -- not before
-every submission. Each queue submission already reports its own queue state.
+Discipline 1 (the queue, the default): run this ONE time per task, before
+the first queue call. Do not run it again in that task. Each queue call
+prints the queue status itself.
+
+Discipline 2 (direct speech, only when the user asks for it): run this one
+time after a BUSY result, and only after other work. Never run it two times
+in a row, and never in a loop.
 
 Usage:
     check_speaker.py

@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Send one utterance to POST /speak (asynchronous, plays on the speaker).
+"""Discipline 2 only: send one text to POST /speak (asynchronous, plays on
+the speaker). Use this only when the user tells you to speak directly. The
+default is Discipline 1: queue_ordered_speech_no_guarantee.py.
 
 Prints exactly one terse line to stdout -- never a raw JSON dump -- so a
 caller reading tool output doesn't burn tokens on formatting.

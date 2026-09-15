@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Discipline 2 only: append one utterance to the unguaranteed playback queue.
+"""Discipline 1 (the default): append one text to the unguaranteed playback queue.
 
 Submits to POST /queue_with_no_guarantee_of_playing and returns at once. The
 text is played in arrival order, after whatever is already ahead of it.
@@ -22,10 +22,11 @@ The server host defaults to $KOKORO_HOST (or 10.0.2.2 if that is unset) and
 the port defaults to $KOKORO_PORT (or 5001). Override either per-call with
 --host/--port, or export the environment variables once for a whole session.
 
-This response already reports queue_entries and queue_seconds after
-submission -- use those to pace your next submission. There is normally no
-need to call check_speaker.py separately for that; see the skill's guidance
-on Discipline 2.
+SPEAKER CHECK: run check_speaker.py ONE time per task, before the first
+queue call. Do not run it again in that task. This script prints
+queue_entries and queue_seconds after every call. Those two numbers are the
+queue status. Use them to pace the next call. The QUEUED and REJECTED lines
+end with "no_speaker_check_needed" as a reminder of this rule.
 
 Exit codes:
     0  -> 202, accepted into the queue (NOT a promise that it plays)
@@ -108,10 +109,10 @@ def main() -> int:
     seconds = body.get("queue_seconds")
 
     if r.status_code == 202:
-        print(f"QUEUED queue_entries={entries} queue_seconds={seconds}")
+        print(f"QUEUED queue_entries={entries} queue_seconds={seconds} no_speaker_check_needed")
         return 0
     if r.status_code == 503:
-        print(f"REJECTED queue_full queue_entries={entries} queue_seconds={seconds}")
+        print(f"REJECTED queue_full queue_entries={entries} queue_seconds={seconds} no_speaker_check_needed")
         return 1
     if r.status_code == 400:
         err = body.get("error", "unknown error")
