@@ -22,11 +22,13 @@ The server host defaults to $KOKORO_HOST (or 10.0.2.2 if that is unset) and
 the port defaults to $KOKORO_PORT (or 5001). Override either per-call with
 --host/--port, or export the environment variables once for a whole session.
 
-SPEAKER CHECK: run check_speaker.py ONE time per task, before the first
-queue call. Do not run it again in that task. This script prints
-queue_entries and queue_seconds after every call. Those two numbers are the
-queue status. Use them to pace the next call. The QUEUED and REJECTED lines
-end with "no_speaker_check_needed" as a reminder of this rule.
+SPEAKER CHECK: run check_speaker.py ONE time per session, before your first
+queue call. Do not run it again in the same session. A new task or a new
+request does not need a new speaker check. This script prints queue_entries
+and queue_seconds after each call. These two numbers are the queue status.
+Use them to set the pace of the next call. The QUEUED and REJECTED lines end
+with "no_speaker_check_needed". This word reminds you of the speaker check
+rule.
 
 Exit codes:
     0  -> 202, accepted into the queue (NOT a promise that it plays)
