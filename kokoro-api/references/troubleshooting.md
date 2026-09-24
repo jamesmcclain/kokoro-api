@@ -18,6 +18,7 @@ the server.
 | `ModuleNotFoundError: requests` | The `requests` package is missing. | Run `pip install requests`. |
 | `BAD_REQUEST 400` with `valid_voices` | The voice name is unknown. | Use a name from the list, or remove `--voice`. |
 | `BAD_REQUEST 400` with `valid_effects` | The preset name is unknown. | Use a name from the list, or remove `--effect`. |
+| `BAD_REQUEST 400` with `crash on this server's CPU` | The server disabled a stage type that the effect needs. | Use a different effect, or remove `--effect`. |
 | `BAD_REQUEST 400` (other) | A parameter is incorrect. | Correct the parameter from the message. Then send the text again. |
 | `BAD_REQUEST local cannot read --effect-file` | The chain file is missing or is not valid JSON. | Write the file again. The script sent nothing. |
 

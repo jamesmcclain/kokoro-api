@@ -35,13 +35,12 @@ RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/wh
 # unescaped '>' as output redirection instead of a version specifier.
 # pedalboard (Spotify's audio effects library) powers the optional "effect"
 # request field; see effects.py. It needs libatomic1 from apt (installed
-# above). scipy provides the filter and solver behind the "monotone"
-# effect stage.
+# above). effects.py deliberately avoids scipy: its bundled math library
+# crashes with "Illegal instruction" on some arm64 CPUs and VMs.
 RUN pip install --no-cache-dir \
     flask \
     "kokoro>=0.7.9" \
     "pedalboard>=0.9" \
-    scipy \
     soundfile
 
 # Kokoro's English g2p (misaki) lazily downloads the spaCy "en_core_web_sm"
@@ -87,11 +86,15 @@ voices_b = ['bf_emma', 'bm_george']; \
 [list(pipeline_b('Hello world', voice=v)) for v in voices_b]" \
     && chmod -R 777 /tmp/huggingface /tmp/torchinductor
 
-# Fail the build, not the container start, if an effects dependency's
-# native extension can't load (e.g. a missing shared library).
-RUN python3 -c "import pedalboard, scipy.linalg, scipy.signal; print('pedalboard', pedalboard.__version__, 'scipy', scipy.__version__)"
-
 COPY effects.py /app/effects.py
+
+# Report which effect stage types work on this CPU. Each stage type runs in
+# its own child process, so one that dies with "Illegal instruction" is
+# listed, not fatal: the server repeats this probe at startup and disables
+# those stage types (and the presets that use them). The build fails here
+# only if effects.py itself is broken. Use `docker build --progress=plain`
+# to see the report.
+RUN python3 effects.py --self-test
 COPY server.py /app/server.py
 
 # Optional operator-defined effect presets. run.sh mounts ./effects.json

@@ -46,11 +46,14 @@ import json
 import math
 import os
 import re
+import signal
+import subprocess
+import sys
 
 import numpy as np
-import pedalboard as pb
-from scipy.linalg import solve_toeplitz
-from scipy.signal import lfilter
+
+# pedalboard is imported lazily (see _pedalboard()) so that a CPU that
+# can't run its native code still gets the numpy-only stages.
 
 MAX_STAGES = 16
 
@@ -75,6 +78,11 @@ _MAX_FILTER_HZ = 11500.0
 # clamped into this range after multiplying.
 _MIN_SPEED = 0.1
 _MAX_SPEED = 3.0
+
+
+def _pedalboard():
+    import pedalboard
+    return pedalboard
 
 
 # --- Stage schema ---------------------------------------------------------
@@ -542,9 +550,14 @@ def load_user_presets(path):
 
 class EffectRegistry:
     """Holds the validated presets. User presets override built-ins with
-    the same name (compared via canonical_name)."""
+    the same name (compared via canonical_name).
 
-    def __init__(self, user_presets_path=None):
+    unsupported: stage types that don't run on this machine (see
+    probe_stage_types()). Chains that use them are refused with a clear
+    message, and /effects marks the affected presets unavailable."""
+
+    def __init__(self, user_presets_path=None, unsupported=()):
+        self.unsupported = frozenset(unsupported)
         self._presets = {}
         self._sources = {}
         for name, stages in BUILTIN_PRESETS.items():
@@ -556,6 +569,17 @@ class EffectRegistry:
 
     def names(self):
         return sorted(self._presets)
+
+    def _blocked(self, stages):
+        return sorted({s["type"] for s in stages} & self.unsupported)
+
+    def _require_supported(self, stages, what):
+        blocked = self._blocked(stages)
+        if blocked:
+            raise EffectError(
+                f"{what} uses stage type(s) {blocked}, which crash on this "
+                "server's CPU and are disabled; choose another effect"
+            )
 
     def resolve(self, effect):
         """Turns a request's 'effect' value into an EffectChain, or None for
@@ -569,9 +593,14 @@ class EffectRegistry:
             stages = self._presets.get(key)
             if stages is None:
                 raise EffectError(f"unknown effect preset '{effect}'")
+            self._require_supported(stages, f"effect preset '{key}'")
             return EffectChain(stages, name=key)
         stages = validate_chain(effect)
+        self._require_supported(stages, "effect")
         return EffectChain(stages, name=None) if stages else None
+
+    def available_names(self):
+        return [n for n in self.names() if not self._blocked(self._presets[n])]
 
     def describe(self):
         """JSON-ready description for GET /effects."""
@@ -582,9 +611,12 @@ class EffectRegistry:
                     "source": self._sources[name],
                     "summary": [stage_label(s) for s in self._presets[name]],
                     "stages": self._presets[name],
+                    "available": not self._blocked(self._presets[name]),
+                    "unavailable_stages": self._blocked(self._presets[name]),
                 }
                 for name in self.names()
             ],
+            "unsupported_stage_types": sorted(self.unsupported),
             "stage_types": {
                 t: {
                     p: {"default": d, "min": lo, "max": hi}
@@ -642,6 +674,12 @@ class EffectChain:
 # whatever a stage is still holding.
 
 _EMPTY = np.zeros(0, dtype=np.float32)
+
+
+# Stage types implemented in numpy alone; everything else uses pedalboard.
+_NUMPY_STAGE_TYPES = frozenset({
+    "volume", "tempo", "monotone", "tremolo", "ring", "overdrive",
+})
 
 
 class _Stage:
@@ -763,6 +801,14 @@ class _MonotoneStage(_Stage):
     frame's loudness, and overlap-add. The pulse train is laid on one
     global grid, so pitch periods line up across frames and chunks.
 
+    Pure numpy, on purpose: scipy's bundled math library crashes with
+    "Illegal instruction" on some arm64 CPUs and VMs. The LPC solve is a
+    Levinson-Durbin recursion, and the all-pole synthesis filter (with the
+    de-emphasis filter folded in) is applied in the frequency domain, one
+    FFT per frame, instead of sample by sample. The FFT buffer is long
+    enough for the filter's ringing to die out before it wraps around, and
+    the wrapped part lands in a warm-up region that is thrown away.
+
     The overlap-add needs FRAME - HOP samples of look-ahead, so this stage
     delays audio by 30 ms and holds that much back until flush().
     """
@@ -771,19 +817,24 @@ class _MonotoneStage(_Stage):
     HOP = 240
     ORDER = 24
     WARMUP = 480
+    FFT_SIZE = 4096
     PRE_EMPHASIS = 0.97
 
     def __init__(self, frequency_hz, sample_rate):
         self._sr = sample_rate
         self._period = sample_rate / frequency_hz
         self._window = np.hanning(self.FRAME + 1)[:-1]  # periodic Hann
-        # Periodic Hann at 75% overlap sums to 2.
+        # Periodic Hann at 75% overlap sums to a constant; undo it.
         self._ola_scale = self.HOP / self._window.sum()
         self._min_lag = int(sample_rate / 400)
         self._max_lag = int(sample_rate / 60)
         self._lag_bias = self.FRAME / (self.FRAME - np.arange(self._max_lag + 1))
         self._rng = np.random.default_rng(0)
-        self._deemph_state = np.zeros(1)
+        # z^-k on the FFT grid, for evaluating A(z) and the de-emphasis
+        # filter's denominator at every bin.
+        omega = 2 * np.pi * np.arange(self.FFT_SIZE // 2 + 1) / self.FFT_SIZE
+        self._zinv = np.exp(-1j * np.outer(np.arange(self.ORDER + 1), omega))
+        self._deemphasis = 1.0 - self.PRE_EMPHASIS * self._zinv[1]
         self._pending = []
 
         latency = self.FRAME - self.HOP
@@ -796,6 +847,21 @@ class _MonotoneStage(_Stage):
         self._to_skip = latency
         self._real_in = 0
         self._emitted = 0
+
+    @staticmethod
+    def _levinson(r, order):
+        """LPC coefficients a[0..order] (a[0] = 1) from autocorrelation r,
+        or None if the recursion becomes unstable."""
+        a = np.zeros(order + 1)
+        a[0] = 1.0
+        err = r[0]
+        for i in range(1, order + 1):
+            k = -np.dot(a[:i], r[i:0:-1]) / err
+            a[1:i + 1] = a[1:i + 1] + k * a[i - 1::-1]
+            err *= 1.0 - k * k
+            if err <= 0 or abs(k) >= 1.0:
+                return None
+        return a
 
     def _synth_frame(self, frame, pre, start):
         n = self.FRAME
@@ -812,17 +878,14 @@ class _MonotoneStage(_Stage):
         voicing = float(np.clip((peak - 0.3) / 0.4, 0.0, 1.0))
 
         # LPC envelope from the pre-emphasized frame.
-        pw = pre * w
-        spec = np.fft.rfft(pw, 2 * n)
+        spec = np.fft.rfft(pre * w, 2 * n)
         rp = np.fft.irfft(np.abs(spec) ** 2)[: self.ORDER + 1]
         if rp[0] <= 0:
             return None
         rp[0] *= 1.0001  # white-noise correction for numerical stability
-        try:
-            a = solve_toeplitz(rp[: self.ORDER], -rp[1:])
-        except np.linalg.LinAlgError:
+        a = self._levinson(rp, self.ORDER)
+        if a is None:
             return None
-        denominator = np.concatenate(([1.0], a))
 
         # Excitation over [start - WARMUP, start + FRAME).
         total = self.WARMUP + n
@@ -837,11 +900,15 @@ class _MonotoneStage(_Stage):
         noise = self._rng.standard_normal(total)
         excitation = math.sqrt(voicing) * pulses + math.sqrt(1 - voicing) * noise
 
-        y = lfilter([1.0], denominator, excitation)[self.WARMUP:] * w
+        # Synthesis filter 1 / (A(z) * (1 - 0.97 z^-1)), applied per bin.
+        response = 1.0 / ((a @ self._zinv) * self._deemphasis)
+        y = np.fft.irfft(np.fft.rfft(excitation, self.FFT_SIZE) * response, self.FFT_SIZE)
+        y = y[self.WARMUP:total] * w
+
         y_energy = float(np.dot(y, y))
         if not math.isfinite(y_energy) or y_energy <= 0:
             return None
-        return y * math.sqrt(float(np.dot(pw, pw)) / y_energy)
+        return y * math.sqrt(energy / y_energy)
 
     def _run_frames(self):
         n, hop = self.FRAME, self.HOP
@@ -859,10 +926,9 @@ class _MonotoneStage(_Stage):
             if y is not None:
                 self._acc[:n] += y * self._ola_scale
             # Samples before pos + hop are final: no later frame reaches them.
-            ready = self._acc[:hop]
+            self._pending.append(self._acc[:hop])
             self._acc = self._acc[hop:]
             self._pos += hop
-            self._pending.append(ready)
         drop = self._pos - self._in_off
         if drop > 0:
             self._in_buf = self._in_buf[drop:]
@@ -880,20 +946,15 @@ class _MonotoneStage(_Stage):
         self._emitted += len(out)
         if len(out) == 0:
             return _EMPTY
-        out, self._deemph_state = lfilter(
-            [1.0], [1.0, -self.PRE_EMPHASIS], out, zi=self._deemph_state
-        )
         return out.astype(np.float32)
 
     def process(self, x):
-        self._pending = []
         self._real_in += len(x)
         self._in_buf = np.concatenate([self._in_buf, np.asarray(x, dtype=np.float64)])
         self._run_frames()
         return self._collect()
 
     def flush(self):
-        self._pending = []
         # Pad with silence so every real sample gets its full overlap.
         self._in_buf = np.concatenate([self._in_buf, np.zeros(self.FRAME)])
         self._run_frames()
@@ -901,11 +962,15 @@ class _MonotoneStage(_Stage):
 
 
 def _pb_chain(plugins):
-    return plugins[0] if len(plugins) == 1 else pb.Pedalboard(plugins)
+    return plugins[0] if len(plugins) == 1 else _pedalboard().Pedalboard(plugins)
 
 
 def _build_stage(stage, sample_rate):
     t = stage["type"]
+    if t in _NUMPY_STAGE_TYPES:
+        pb = None
+    else:
+        pb = _pedalboard()
     pedal = lambda plugin, **kw: _PedalboardStage(plugin, sample_rate, **kw)
     if t == "highpass":
         return pedal(pb.HighpassFilter(cutoff_frequency_hz=stage["cutoff_hz"]))
@@ -1050,3 +1115,170 @@ class EffectProcessor:
                 out = out.copy()
                 out[-fade:] *= np.linspace(1.0, 0.0, fade, dtype=np.float32)
         return out
+
+
+# --- CPU support probe ----------------------------------------------------
+#
+# pedalboard ships prebuilt native code. On some CPUs part of that code
+# uses instructions the processor lacks, and the whole Python process dies
+# with SIGILL ("Illegal instruction") the first time the code runs; no
+# exception is raised, so it can't be caught in-process. The probe runs
+# every stage type in a child process instead: the child reports each
+# type it finishes, and when it dies, the type it was working on is marked
+# unsupported and a fresh child continues with the rest.
+
+# A representative configuration per stage type. bitcrush is probed with
+# downsampling on, so the resampler is exercised too.
+_PROBE_OVERRIDES = {"bitcrush": {"downsample": 8}}
+
+# Test hook: comma-separated stage types the probe child kills itself on,
+# as if they had crashed. Lets the fallback path be tested anywhere.
+_SIMULATE_CRASH_ENV = "KOKORO_EFFECTS_SIMULATE_CRASH"
+
+
+def _simulated_crashes():
+    return set(filter(None, os.environ.get(_SIMULATE_CRASH_ENV, "").split(",")))
+
+
+def _probe_import_worker():
+    """Child process: just import pedalboard. ("import" in the simulate
+    list fakes a crash here.)"""
+    if "import" in _simulated_crashes():
+        os.kill(os.getpid(), signal.SIGILL)
+    _pedalboard()
+    print("OK import", flush=True)
+
+
+def _describe_exit(code):
+    if isinstance(code, int) and code < 0:
+        try:
+            return signal.Signals(-code).name
+        except ValueError:
+            return f"signal {-code}"
+    return f"exit {code}"
+
+
+def _probe_worker(stage_types):
+    simulated = _simulated_crashes()
+    sample_rate = 24000
+    tone = (0.3 * np.sin(np.arange(6000) * 0.06)).astype(np.float32)
+    for stage_type in stage_types:
+        print(f"START {stage_type}", flush=True)
+        if stage_type in simulated:
+            os.kill(os.getpid(), signal.SIGILL)
+        stage = validate_stage({"type": stage_type, **_PROBE_OVERRIDES.get(stage_type, {})})
+        processor = EffectChain([stage]).new_processor(sample_rate)
+        processor.process(tone)
+        processor.process(tone[:1000])
+        processor.flush()
+        print(f"OK {stage_type}", flush=True)
+
+
+def probe_stage_types(timeout=120):
+    """Returns (unsupported_types, details). details maps each unsupported
+    type to how its child process ended."""
+    remaining = list(STAGE_SPECS)
+    unsupported = {}
+
+    # Step 1: can pedalboard even be imported? If not, every stage type
+    # that needs it is out, without spawning one crashing child per type.
+    try:
+        proc = subprocess.run(
+            [sys.executable, os.path.abspath(__file__), "--probe-import"],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        import_ok = proc.returncode == 0 and "OK import" in proc.stdout
+        how = _describe_exit(proc.returncode)
+    except subprocess.TimeoutExpired:
+        import_ok, how = False, "timeout"
+    if not import_ok:
+        for stage_type in remaining:
+            if stage_type not in _NUMPY_STAGE_TYPES:
+                unsupported[stage_type] = f"import pedalboard: {how}"
+        remaining = [t for t in remaining if t in _NUMPY_STAGE_TYPES]
+
+    # Step 2: run each remaining stage type.
+    while remaining:
+        try:
+            proc = subprocess.run(
+                [sys.executable, os.path.abspath(__file__), "--probe-worker", *remaining],
+                capture_output=True, text=True, timeout=timeout,
+            )
+            output, code = proc.stdout, proc.returncode
+        except subprocess.TimeoutExpired as e:
+            output = e.stdout.decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
+            code = "timeout"
+        done = {line[3:] for line in output.splitlines() if line.startswith("OK ")}
+        started = [line[6:] for line in output.splitlines() if line.startswith("START ")]
+        remaining = [t for t in remaining if t not in done]
+        if code == 0 and not remaining:
+            break
+        # The child died (or hung) on the last type it started. If it died
+        # before starting any type, blame the first remaining one.
+        culprit = started[-1] if started and started[-1] in remaining else remaining[0]
+        unsupported[culprit] = _describe_exit(code)
+        remaining.remove(culprit)
+    return set(unsupported), unsupported
+
+
+def cpu_report():
+    """One line naming the CPU and which common SIMD extensions it has."""
+    model, flags = "unknown", set()
+    try:
+        with open("/proc/cpuinfo", encoding="utf-8") as f:
+            for line in f:
+                key, _, value = line.partition(":")
+                key = key.strip()
+                if key in ("model name", "Model", "CPU part") and model == "unknown":
+                    model = value.strip()
+                elif key in ("flags", "Features") and not flags:
+                    flags = set(value.split())
+    except OSError:
+        pass
+    interesting = ["sse4_2", "avx", "avx2", "fma", "bmi2", "avx512f",
+                   "asimd", "sve", "sve2", "sme"]
+    have = [f for f in interesting if f in flags]
+    missing = [f for f in interesting[:6] if flags and f not in flags]
+    import platform
+    return (f"cpu: {platform.machine()} {model}; has {' '.join(have) or 'none'}"
+            + (f"; lacks {' '.join(missing)}" if missing else ""))
+
+
+def self_test():
+    """Printed during the image build. Always exits 0 unless effects.py
+    itself is broken: an unsupported stage disables effects that use it,
+    it doesn't stop the build."""
+    # Never import pedalboard in this process: on an affected CPU the
+    # import alone kills the process. Flush every line, so nothing is lost
+    # if something else does crash.
+    registry = EffectRegistry()
+    print(cpu_report(), flush=True)
+    from importlib import metadata
+    try:
+        version = metadata.version("pedalboard")
+    except metadata.PackageNotFoundError:
+        version = "not installed"
+    print(f"pedalboard: {version}  numpy: {np.__version__}", flush=True)
+    unsupported, details = probe_stage_types()
+    if not unsupported:
+        print(f"effects self-test: all {len(STAGE_SPECS)} stage types work; "
+              f"all {len(registry.names())} presets available")
+        return
+    registry = EffectRegistry(unsupported=unsupported)
+    print("effects self-test: these stage types crash on this CPU and will be disabled:")
+    for stage_type in sorted(details):
+        print(f"  {stage_type}: {details[stage_type]}")
+    available = registry.available_names()
+    print(f"presets still available ({len(available)}/{len(registry.names())}): "
+          + (", ".join(available) or "none"), flush=True)
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--probe-worker":
+        _probe_worker(sys.argv[2:])
+    elif sys.argv[1:] == ["--probe-import"]:
+        _probe_import_worker()
+    elif sys.argv[1:] == ["--self-test"]:
+        self_test()
+    else:
+        sys.exit("usage: effects.py --self-test")

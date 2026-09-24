@@ -72,8 +72,14 @@ Facts about the stages:
 
 ## Errors
 
+- If `list_effects.py` shows `[UNAVAILABLE: ...]` after a preset name, the
+  server cannot run that preset. Do not use it. Tell the user, and offer an
+  available preset.
+
 - If the output contains `valid_effects=[...]`, the preset name is unknown.
   Use a name from that list.
+- If the message says `crash on this server's CPU`, the effect needs a stage
+  type that the server disabled. Use a different effect, or no effect.
 - If the output starts with `BAD_REQUEST 400`, the message gives the incorrect
   stage or parameter. Correct it. Then send the text again.
 - If the output starts with `BAD_REQUEST local cannot read --effect-file`, the

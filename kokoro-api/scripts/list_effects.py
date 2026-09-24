@@ -4,6 +4,10 @@
 Prints one terse line per preset, e.g.:
     audiobook: HP 85Hz, Comp -22dB 3:1, EQ 2500Hz +2dB, Reverb 10%
     whisper (user): HP 1000Hz, Gain -6dB
+    ai [UNAVAILABLE: pitch]: Pitch +150, Phaser 0.40Hz, ...
+
+UNAVAILABLE means the server's CPU cannot run a stage that the preset
+needs. Do not use that preset.
 
 With --stages, also prints every stage type and its parameter ranges, one
 line per type, for building an inline chain for --effect-file:
@@ -64,11 +68,18 @@ def main() -> int:
 
     for preset in body.get("presets", []):
         tag = " (user)" if preset.get("source") == "user" else ""
+        if preset.get("available") is False:
+            tag += f" [UNAVAILABLE: {', '.join(preset.get('unavailable_stages', []))}]"
         print(f"{preset['name']}{tag}: {', '.join(preset.get('summary', []))}")
 
     if args.stages:
         print(f"-- stage types (max {body.get('max_stages')} stages per chain) --")
+        unsupported = set(body.get("unsupported_stage_types", []))
+        if unsupported:
+            print(f"-- unavailable on this server: {', '.join(sorted(unsupported))} --")
         for stage_type, params in sorted(body.get("stage_types", {}).items()):
+            if stage_type in unsupported:
+                continue
             parts = [
                 f"{name}={p['default']:g}[{p['min']:g}..{p['max']:g}]"
                 for name, p in params.items()
