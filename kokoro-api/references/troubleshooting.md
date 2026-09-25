@@ -32,12 +32,12 @@ the server.
 
 Do not run `check_speaker.py` to find a queue fault. It cannot find one.
 
-## Direct speech results (Discipline 2)
+## Speaker check results
 
 | Result | Cause | Action |
 |--------|-------|--------|
-| `BUSY 409` | The speaker plays other audio. This is not an error. | Obey the procedure in `direct-speech.md`. |
-| `BUSY` with `0.0` seconds | The estimate was too short. The playback is almost complete. | Run `check_speaker.py` again later, after other work. |
+| `BUSY` from `check_speaker.py` | The speaker plays other audio. This is not an error. | Start the queue procedure. Do not wait. |
+| `BUSY` with `0.0` seconds | The estimate was too short. The playback is almost complete. | Start the queue procedure. Do not run `check_speaker.py` again. |
 
 ## Other symptoms
 

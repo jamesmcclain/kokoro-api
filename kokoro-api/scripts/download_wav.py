@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Discipline 3 only: synchronous WAV download via POST /speak, play=false.
+"""Discipline 2 only: synchronous WAV download via POST /speak, play=false.
 
 Never touches the speaker, never returns 409, produces no sound. Blocks
 until synthesis completes -- synthesis time grows with text length.

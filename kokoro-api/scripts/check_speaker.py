@@ -1,23 +1,22 @@
 #!/usr/bin/env python3
-"""Check GET /speaker once. Instant, does not change server state.
+"""Speaker check: send one GET /speaker request. The request is fast. It does
+not change the state of the server.
 
-Prints exactly one terse line, e.g.:
+The script prints one short line. For example:
     FREE queue_entries=0 queue_seconds=0.0
     BUSY queue_entries=3 estimated_seconds_until_free=41.7
 
-`queue_entries` counts utterances still waiting behind whatever is playing,
-so BUSY with queue_entries=0 means one utterance and nothing after it. The
-seconds figure covers the whole pipeline: current audio plus every queued
-entry. It never reports whether any particular queued entry was played --
-nothing does.
+`queue_entries` is the number of texts that wait after the audio that plays
+now. Thus, BUSY with queue_entries=0 means that one text plays and no text
+waits. The number of seconds includes the current audio and all texts in the
+queue. The script cannot tell you if a queued text played. No script can.
 
-Discipline 1 (the queue, the default): run this ONE time per task, before
-the first queue call. Do not run it again in that task. Each queue call
-prints the queue status itself.
-
-Discipline 2 (direct speech, only when the user asks for it): run this one
-time after a BUSY result, and only after other work. Never run it two times
-in a row, and never in a loop.
+Run this script ONE time per session, before your first queue call
+(queue_ordered_speech_no_guarantee.py). Do not run it again in the same
+session. A new task or a new request does not need a new speaker check. Each
+queue call prints the queue status. FREE and BUSY do not change the next
+step: start the queue procedure. Run this script again in the same session
+only if an unusual condition makes it necessary. Do not run it in a loop.
 
 Usage:
     check_speaker.py

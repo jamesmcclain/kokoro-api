@@ -1,4 +1,4 @@
-# Discipline 3 — WAV Download
+# Discipline 2 — WAV Download
 
 Use this discipline only when the user asks for an audio file. This
 discipline does not use the speaker. It makes no sound.

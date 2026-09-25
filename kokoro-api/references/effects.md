@@ -1,7 +1,7 @@
 # Audio Effects
 
 An effect changes the sound of a voice. Examples are a radio sound or an
-8-bit game sound. Effects work in all three disciplines. An effect does not
+8-bit game sound. Effects work in both disciplines. An effect does not
 change how the queue, the speaker, or the download work.
 
 **Use an effect only when the user asks for one.** The default is no effect.

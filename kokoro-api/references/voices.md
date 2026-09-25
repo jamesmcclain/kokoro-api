@@ -9,8 +9,10 @@ The server keeps these voices in its cache. They start with no delay:
 
 ```
 af_heart, af_river, af_alloy, af_nicole, am_santa, am_michael, am_onyx,
-bf_emma, bm_george
+am_adam, am_echo, bf_emma, bm_george
 ```
+
+`scripts/random_voice.py` selects only from these voices.
 
 Other voices work too. The first request for another voice is slow, because
 the server downloads it one time.
